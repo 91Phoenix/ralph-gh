@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# Thin launcher: run the loop from a checkout without installing the package.
+set -euo pipefail
+_HERE="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")/.." && pwd)"
+command -v python3 >/dev/null 2>&1 || { echo "FATAL: python3 not on PATH" >&2; exit 1; }
+PYTHONPATH="$_HERE${PYTHONPATH:+:$PYTHONPATH}" exec python3 -m ralph_gh "$@"

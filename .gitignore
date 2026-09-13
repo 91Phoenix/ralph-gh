@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+dist/
+build/
+*.egg-info/
+# loop artifacts never belong in this repo either
+BUILD_OK
+BUILD_FAIL
+.ralph-*.md

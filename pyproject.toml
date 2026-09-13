@@ -1,0 +1,22 @@
+[project]
+name = "ralph-gh"
+version = "0.1.0"
+description = "Autonomous GitHub issue implementer: works a GitHub Project's ready frontier with headless Claude Code sessions."
+requires-python = ">=3.9"
+dependencies = []
+
+[project.scripts]
+ralph-gh = "ralph_gh.__main__:main"
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["ralph_gh"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

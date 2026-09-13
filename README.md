@@ -1,0 +1,229 @@
+# ralph-gh
+
+An **autonomous GitHub issue implementer**. Point it at a GitHub Project (v2)
+and, for up to ~5 hours, it works the project's *ready frontier*: for every
+open issue that is in the Ready column, carries the `ready-for-agent` label,
+is unassigned and has no open blockers, it spins up a fresh headless Claude
+Code session that implements the issue test-first, pushes a branch, opens a
+draft pull request, waits for the GitHub checks (auto-fixing a red run up to
+twice), marks the PR ready, reviews it with a second session, addresses one
+round of review comments with a third, and leaves the PR open for **you** to
+merge. When a PR merges the issue moves to Done — which unblocks the issues
+that depended on it — and the loop keeps going.
+
+It is a single-user tool. Everything goes through the `gh` CLI you are
+already logged into: no MCP servers, no tokens of its own, no service
+account. Commits and PRs are yours.
+
+Inspired by the Jira/Bitbucket Ralph Loop in `bs-agents-skills`, rebuilt for
+GitHub Issues + GitHub Projects.
+
+## Prerequisites
+
+- `claude` (Claude Code CLI), `git`, `gh`, `python3` ≥ 3.9 on `PATH`.
+- `gh auth login` done, **with the `project` scope**. The default `gh` token
+  has `repo` and `workflow` but not `project`; add it once:
+
+  ```bash
+  gh auth refresh -h github.com -s project
+  ```
+
+- Local git access to every target repository through your own auth — either
+  the gh credential helper (`gh auth setup-git`) or an SSH key that works
+  non-interactively. The loop clones and pushes as you; it never embeds a
+  token in a remote URL.
+- Optional: the skills the worker prompts refer to (`/tdd`, `/code-review`)
+  installed in `~/.claude/skills/`. See [skills/](skills/README.md). Workers
+  are told to follow the same discipline by hand when a skill is missing.
+
+## Set up the project once
+
+1. Create a GitHub Project (user or org, the new "Projects v2" kind) and add
+   the issues you want implemented. Issues from several repositories may live
+   in one project.
+2. Make sure the project's **Status** field has columns the loop can map to:
+   a *Ready* column (`Ready`, `Todo` or `To Do`), an *In Progress* column, an
+   *In Review* column and a *Done* column. Any other names work too — set
+   `ST_READY`, `ST_INPROGRESS`, `ST_REVIEW`, `ST_DONE` to pipe-separated
+   aliases (`ST_READY="Backlog|Ready"`). A missing In Review or Done column
+   only costs a warning; a missing Ready column stops the loop.
+3. Label the issues an agent may pick up with `ready-for-agent` (or set
+   `AGENT_LABEL`; an empty value disables the requirement).
+4. Express ordering with GitHub's native **issue dependencies** ("Blocked by"
+   in the issue sidebar, GA since 2025) or with a `## Blocked by` heading in
+   the body listing `#12`, `owner/repo#12` or issue URLs. An issue is blocked
+   until every blocker is **closed**.
+
+## Shape of an issue
+
+Nothing is mandatory: the issue lives in a repository, so the loop already
+knows where the work goes and which branch is the default. Two optional
+headings refine that — they must be real Markdown headings, prose that merely
+says "Repository: x" is ignored:
+
+```markdown
+## Repository
+acme/backend            <- implement here instead of the issue's own repo
+
+## Target branch
+development             <- base the work on, and target the PR at, this branch
+```
+
+`## Repository` also accepts `acme/backend — trunk development` as a
+one-liner, or `none` to mark a manual issue the loop must skip. Without a
+target branch the repository's default branch is used — and corrected
+automatically when git proves it is a stale stub of a real trunk (say `main`
+with one commit while `development` carries everything).
+
+## Run it
+
+```bash
+# from a checkout
+bin/ralph-gh https://github.com/users/<you>/projects/3
+bin/ralph-gh <you>/3                       # short form
+bin/ralph-gh <you>/3 <you>/some-repo       # fallback repo for issues that
+                                           # carry a "## Repository: none"-less
+                                           # planning-repo body — rarely needed
+
+# or install it
+uv tool install .   # or: pipx install .
+ralph-gh <you>/3
+```
+
+The **preflight** refuses to start unless the toolchain is real: the three
+CLIs are on `PATH`, `gh auth status` passes, the project resolves (a token
+without the `project` scope gets the exact `gh auth refresh` line to run),
+the Status field has a Ready column, and your local git auth reaches the
+frontier's repositories.
+
+## What happens per issue
+
+Each phase is a **fresh** `claude -p` session run inside the issue's own
+workspace clone (`~/ralph-gh-workspaces/<owner>__<repo>--<n>`), with
+`--permission-mode bypassPermissions`. The session and the orchestrator talk
+through files at the workspace root that are git-excluded so no worker can
+commit them: `.ralph-ticket.md` (the issue), `.ralph-siblings.md` (one line
+per other item in the project, context only), `.ralph-pr-body.md` (the PR
+description the implement session writes), `.ralph-pr-comments.md` (the
+review comments the address session reads), `BUILD_OK` / `BUILD_FAIL`.
+
+1. **Claim.** Assign the issue to you, Status → In Progress, comment.
+2. **Implement.** Clone/refresh the workspace, cut `feature/issue-<n>` from
+   the target branch (`feature/<repo>-<n>` when the issue lives in a different
+   repo than the code). The worker reads the issue, implements test-first,
+   runs the same commands the repo's GitHub Actions workflow runs, and writes
+   `BUILD_OK` + the PR body, or `BUILD_FAIL` with a four-line plain-English
+   reason. A session that leaves neither died mid-stream (API stall, DNS
+   blip): it is retried once from a clean tree, and if it keeps dying the
+   issue is **requeued** — back to Ready, unassigned, no human needed — up to
+   `RALPH_TRANSIENT_PARK_CAP` times before it is parked.
+3. **Push + guard.** Push with `--force-with-lease`, then prove the branch is
+   cleanly based on the target: the recorded base commit is still an ancestor
+   of both sides and the PR would show **none of anybody else's commits**. If
+   the default target fails the guard but exactly one other long-lived branch
+   passes it, the PR is retargeted there with a comment; otherwise the issue
+   is parked with the branch pushed.
+4. **Open a draft PR** titled `<issue title> (#<n>)`, body = the worker's
+   description under a `Closes #<n>` line. Status → In Review.
+5. **Verify checks.** Poll the check runs and commit statuses on the branch
+   head. Red → a *pipeline-fix* session reads the failing run with
+   `gh run view --log-failed`, fixes, re-runs the build, commits; re-push;
+   capped at `FIX_CAP`. Still red → the PR stays a draft and the issue is
+   parked `needs-human`. A repository with no CI at all passes on the local
+   build gate.
+6. **Mark ready for review**, then a *review* session posts each finding as
+   its own PR comment (`LGTM — no blocking issues.` when there are none). A
+   review that posts nothing is reported honestly as UNREVIEWED.
+7. **Address.** One session works through every comment: fix it (with a test)
+   or reply why not; code changes are pushed and re-verified.
+8. **Done for the agent.** Comment "ready for a human to merge". The PR is
+   yours.
+
+Meanwhile, every poll (`POLL_SECONDS`, default 5 min):
+
+- **Merges close issues.** A merged PR moves its issue to Done and closes it,
+  which unblocks dependants. The loop's other open PRs on the same repo are
+  rebased onto the target and force-pushed; a conflicting rebase gets one
+  Claude session to resolve it, and is aborted (branch untouched, issue
+  labelled `needs-human`) if that fails.
+- **Edited issues resync.** An issue edited after its branch's last commit
+  (with a grace of `RALPH_RESYNC_GRACE` seconds) gets one catch-up session
+  that re-reads the acceptance criteria and closes only the gap, capped at
+  `RALPH_RESYNC_CAP` passes. The loop's own comments and status changes do
+  not count as edits.
+- **Idle is explained.** When nothing is grabbable, one log line per open
+  item says why (`status=In Progress`, `no ready-for-agent label`,
+  `blocked-by acme/app#3`, `assigned:you`).
+- **A watchdog** kills a pipeline that has run for `3 × SESSION_TIMEOUT`.
+
+Parking = `needs-human` label + a comment saying exactly what to decide, and
+the issue back in Ready so you see it. The loop never picks up an issue that
+carries `needs-human`; remove the label after acting.
+
+## Configuration
+
+Everything is an environment variable.
+
+| Var | Default | Meaning |
+|-----|---------|---------|
+| `ST_READY` | `Ready\|Todo\|To Do` | Status option(s) an issue is picked from |
+| `ST_INPROGRESS` | `In Progress` | Status while a session works |
+| `ST_REVIEW` | `In Review\|Review` | Status once the PR exists |
+| `ST_DONE` | `Done` | Status when the PR merged |
+| `AGENT_LABEL` | `ready-for-agent` | required label; `""` disables |
+| `NEEDS_HUMAN_LABEL` | `needs-human` | label a parked issue gets |
+| `TARGET_BRANCH` | *(repo default)* | global fallback base/PR-target branch |
+| `RALPH_TRUNK_CANDIDATES` | `development develop main master` | branches that may prove the default is a stub |
+| `RALPH_WORKSPACES` | `~/ralph-gh-workspaces` | clones, `.state/`, `.logs/` |
+| `MAX_CONCURRENT` | `2` | issues in flight at once |
+| `POLL_SECONDS` | `300` | poll interval |
+| `MAX_RUNTIME` | `18000` | total wall-clock seconds (~5h) |
+| `SESSION_TIMEOUT` | `5400` | per worker session |
+| `CHECKS_POLL_MAX` / `CHECKS_POLL_WAIT` | `40` / `30` | how long to wait for checks |
+| `FIX_CAP` | `2` | auto-fix attempts on red checks |
+| `RALPH_TRANSIENT_RETRIES` | `1` | in-pipeline retries of a session that died mid-stream |
+| `RALPH_TRANSIENT_PARK_CAP` | `3` | requeues before a transient death parks the issue |
+| `RALPH_RESYNC` / `RALPH_RESYNC_CAP` / `RALPH_RESYNC_GRACE` | `1` / `2` / `600` | catch-up passes on edited issues |
+| `RALPH_REBASE_RESOLVE` | `1` | let Claude resolve sibling-rebase conflicts |
+| `RALPH_DRAFT_PRS` | `1` | open PRs as drafts until checks are green |
+| `RALPH_MODEL` | *(CLI default)* | `--model` for worker sessions |
+| `RALPH_WORKER_SYS` | terse-output prompt | `--append-system-prompt` for workers; `""` disables |
+| `RALPH_WORKER_EXTRA_ARGS` | | extra flags appended to every `claude -p` |
+| `RALPH_SKILL_IMPLEMENT` / `RALPH_SKILL_REVIEW` | `tdd` / `code-review` | skills the prompts name |
+| `RALPH_GIT_PROTOCOL` | `auto` | `https` (gh credential helper) or `ssh`; auto probes both |
+
+The default worker system prompt asks for maximally compressed progress
+narration (it is never read) while forcing **failure text into plain
+English** — the `BUILD_FAIL` contents, the PR body and every PR comment are
+written for a human. Set `RALPH_WORKER_SYS=""` for ordinary output.
+
+## State and logs
+
+```
+~/ralph-gh-workspaces/
+├── .state/    one file per issue attribute: <key>.state, .pr, .branch, .repo,
+│              .target, .base, .started, .project, .resync_*, .transient_deaths
+├── .logs/     <key>-implement.log, -review.log, -address.log,
+│              -pipelinefix-N.log, -resync-N.log, -rebase-resolve.log
+└── <owner>__<repo>--<n>/   the per-issue clone
+```
+
+State outlives runs and is shared by every project ever looped on the
+machine; each entry records the project that launched it and every
+merge-detect, rebase and resync pass skips entries another project owns. It
+also survives being stale: a PR merged by hand between runs is noticed on the
+next poll and closes its issue instead of being rebased.
+
+## Development
+
+```bash
+uv run --group dev pytest -q      # 211 tests, no network, real git repos in tmp
+```
+
+`ralph_gh/` layout: `config` (env knobs) · `text` (issue-body parsing) ·
+`github` (gh CLI runner + REST/GraphQL shapes) · `tracker` (Project-backed
+tracker facade) · `frontier` (readiness) · `gitrepo` / `gitops` (git and the
+branch-base invariants) · `worker` (sessions, markers, prompts) ·
+`orchestrator` (the pipeline) · `launcher` / `__main__` (wiring, preflight,
+poll loop). Tests fake every collaborator and a conformance test pins the
+fakes to the real classes' method sets.
