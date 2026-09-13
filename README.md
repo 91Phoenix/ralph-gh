@@ -20,7 +20,9 @@ GitHub Issues + GitHub Projects.
 
 ## Prerequisites
 
-- `claude` (Claude Code CLI), `git`, `gh`, `python3` ≥ 3.9 on `PATH`.
+- An agent CLI for the worker sessions — `claude` (Claude Code, the default)
+  or `opencode` (see [Running on OpenCode](#running-on-opencode-or-kilo)) —
+  plus `git`, `gh`, `python3` ≥ 3.9 on `PATH`.
 - `gh auth login` done, **with the `project` scope**. The default `gh` token
   has `repo` and `workflow` but not `project`; add it once:
 
@@ -98,9 +100,10 @@ frontier's repositories.
 
 ## What happens per issue
 
-Each phase is a **fresh** `claude -p` session run inside the issue's own
+Each phase is a **fresh** headless agent session (`claude -p` by default,
+`opencode run --auto` with `RALPH_AGENT=opencode`) run inside the issue's own
 workspace clone (`~/ralph-gh-workspaces/<owner>__<repo>--<n>`), with
-`--permission-mode bypassPermissions`. The session and the orchestrator talk
+permission prompts bypassed. The session and the orchestrator talk
 through files at the workspace root that are git-excluded so no worker can
 commit them: `.ralph-ticket.md` (the issue), `.ralph-siblings.md` (one line
 per other item in the project, context only), `.ralph-pr-body.md` (the PR
@@ -160,6 +163,34 @@ Parking = `needs-human` label + a comment saying exactly what to decide, and
 the issue back in Ready so you see it. The loop never picks up an issue that
 carries `needs-human`; remove the label after acting.
 
+## Running on OpenCode (or Kilo)
+
+The worker sessions can run on [OpenCode](https://opencode.ai) instead of
+Claude Code:
+
+```bash
+export RALPH_AGENT=opencode
+export RALPH_MODEL=anthropic/claude-sonnet-4-5   # provider/model, OpenCode's format
+ralph-gh <you>/3
+```
+
+What changes under the hood:
+
+| | `RALPH_AGENT=claude` (default) | `RALPH_AGENT=opencode` |
+|---|---|---|
+| command | `claude -p <prompt> --permission-mode bypassPermissions --add-dir <ws>` | `opencode run --auto --dir <ws> <prompt>` |
+| style prompt | `--append-system-prompt` | prepended to the message (OpenCode has no system-prompt flag) |
+| model flag | `--model <name>` | `--model <provider/model>` |
+| skills | `/tdd`, `/code-review` from `~/.claude/skills` | same folders — OpenCode reads `~/.claude/skills` and loads a skill with its `skill` tool; the prompts say so |
+| permissions | bypassed | `--auto` approves everything not explicitly denied in `opencode.json` |
+
+`RALPH_AGENT_EXTRA_ARGS` appends flags to every session in either mode
+(`--variant high`, `--agent build`, …). The Kilo CLI is an OpenCode fork with
+the same `run --auto` interface, so `RALPH_AGENT=opencode RALPH_AGENT_BIN=kilo`
+runs the workers on Kilo; it reads `kilo.json`, not `opencode.json`.
+Anything else — `gh`, git, the markers, the pipeline — is agent-agnostic. The
+preflight checks that whichever binary you picked is on `PATH`.
+
 ## Configuration
 
 Everything is an environment variable.
@@ -186,9 +217,11 @@ Everything is an environment variable.
 | `RALPH_RESYNC` / `RALPH_RESYNC_CAP` / `RALPH_RESYNC_GRACE` | `1` / `2` / `600` | catch-up passes on edited issues |
 | `RALPH_REBASE_RESOLVE` | `1` | let Claude resolve sibling-rebase conflicts |
 | `RALPH_DRAFT_PRS` | `1` | open PRs as drafts until checks are green |
-| `RALPH_MODEL` | *(CLI default)* | `--model` for worker sessions |
-| `RALPH_WORKER_SYS` | terse-output prompt | `--append-system-prompt` for workers; `""` disables |
-| `RALPH_WORKER_EXTRA_ARGS` | | extra flags appended to every `claude -p` |
+| `RALPH_AGENT` | `claude` | `claude` or `opencode` — which CLI runs worker sessions |
+| `RALPH_AGENT_BIN` | *(= `RALPH_AGENT`)* | executable override, e.g. `kilo` with `RALPH_AGENT=opencode` |
+| `RALPH_MODEL` | *(CLI default)* | `--model` for worker sessions (`provider/model` on OpenCode) |
+| `RALPH_WORKER_SYS` | terse-output prompt | style prompt for workers (system prompt on Claude, message prefix on OpenCode); `""` disables |
+| `RALPH_AGENT_EXTRA_ARGS` | | extra flags appended to every worker session |
 | `RALPH_SKILL_IMPLEMENT` / `RALPH_SKILL_REVIEW` | `tdd` / `code-review` | skills the prompts name |
 | `RALPH_GIT_PROTOCOL` | `auto` | `https` (gh credential helper) or `ssh`; auto probes both |
 

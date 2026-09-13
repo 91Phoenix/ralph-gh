@@ -10,6 +10,9 @@ one. The optional 2nd argument is only a FALLBACK for that heading.
 
 Auth: whatever `gh auth login` configured. The token needs the `project`
 scope on top of `repo` (`gh auth refresh -h github.com -s project`).
+
+Worker agent: RALPH_AGENT=claude (default, `claude -p`) or RALPH_AGENT=opencode
+(`opencode run --auto`; RALPH_AGENT_BIN=kilo for the Kilo CLI).
 """
 
 import multiprocessing
@@ -36,9 +39,11 @@ def warn(msg: str) -> None:
 # ---------------------------------------------------------------------------
 def preflight(cfg: Config, orch: Orchestrator) -> dict:
     log("Preflight checks...")
-    for tool in ("claude", "git", "gh"):
+    for tool in (cfg.agent_command, "git", "gh"):
         if not shutil.which(tool):
-            sys.exit(f"FATAL: '{tool}' not on PATH.")
+            sys.exit(f"FATAL: '{tool}' not on PATH"
+                     + (f" (RALPH_AGENT={cfg.agent})." if tool == cfg.agent_command
+                        else "."))
     if not orch.gh.gh.auth_ok():
         sys.exit("FATAL: `gh auth status` failed — run `gh auth login` first.")
 
@@ -140,7 +145,8 @@ def main(argv=None) -> int:
         f"target branch (fallback: {cfg.target_branch or 'repo default'})")
     log(f"Concurrency: {cfg.max_concurrent} | Poll: {cfg.poll_seconds}s | "
         f"Runtime: {cfg.max_runtime}s")
-    log(f"Model: {cfg.model or '(CLI default)'} | Draft PRs: {cfg.draft_prs} | "
+    log(f"Agent: {cfg.agent} ({cfg.agent_command}) | "
+        f"Model: {cfg.model or '(CLI default)'} | Draft PRs: {cfg.draft_prs} | "
         f"Resync: {cfg.resync} | Workspaces: {cfg.workspace_base}")
     log("================")
 

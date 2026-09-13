@@ -52,6 +52,14 @@ class TestConfig:
         assert c.st_ready == "Backlog"
         assert c.model == "opus"
 
+    def test_agent_selection(self):
+        assert Config.from_env("o/1", env={}).agent == "claude"
+        c = Config.from_env("o/1", env={"RALPH_AGENT": "OpenCode", "RALPH_AGENT_BIN": "kilo"})
+        assert c.agent == "opencode" and c.agent_command == "kilo"
+        assert Config.from_env("o/1", env={}).agent_command == "claude"
+        with pytest.raises(ValueError):
+            Config.from_env("o/1", env={"RALPH_AGENT": "aider"})
+
     def test_bad_int_falls_back(self):
         assert Config.from_env("o/1", env={"MAX_CONCURRENT": "x"}).max_concurrent == 2
 

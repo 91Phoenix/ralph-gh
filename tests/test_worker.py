@@ -95,8 +95,7 @@ class TestSessionFailure:
 
 
 class TestRunner:
-    def test_command_shape(self, monkeypatch):
-        monkeypatch.delenv("RALPH_WORKER_EXTRA_ARGS", raising=False)
+    def test_command_shape(self):
         cmd = worker.WorkerRunner(CFG).command("/ws", "do it")
         assert cmd[:3] == ["claude", "-p", "do it"]
         assert "--permission-mode" in cmd and "bypassPermissions" in cmd
@@ -104,13 +103,41 @@ class TestRunner:
         assert "--model" not in cmd
         assert "--mcp-config" not in cmd and "--strict-mcp-config" not in cmd
 
-    def test_model_and_extra_args(self, monkeypatch):
-        monkeypatch.setenv("RALPH_WORKER_EXTRA_ARGS", "--verbose")
-        cfg = Config.from_env("o/1", env={"RALPH_MODEL": "opus", "RALPH_WORKER_SYS": ""})
+    def test_model_and_extra_args(self):
+        cfg = Config.from_env("o/1", env={"RALPH_MODEL": "opus", "RALPH_WORKER_SYS": "",
+                                           "RALPH_AGENT_EXTRA_ARGS": "--verbose"})
         cmd = worker.WorkerRunner(cfg).command("/ws", "p")
         assert cmd[cmd.index("--model") + 1] == "opus"
         assert "--append-system-prompt" not in cmd
         assert cmd[-1] == "--verbose"
+
+    def test_opencode_command_shape(self):
+        cfg = Config.from_env("o/1", env={"RALPH_AGENT": "opencode",
+                                           "RALPH_MODEL": "anthropic/claude-sonnet-4-5",
+                                           "RALPH_WORKER_SYS": "STYLE",
+                                           "RALPH_AGENT_EXTRA_ARGS": "--variant high"})
+        cmd = worker.WorkerRunner(cfg).command("/ws", "do it")
+        assert cmd[:3] == ["opencode", "run", "--auto"]
+        assert cmd[cmd.index("--dir") + 1] == "/ws"
+        assert cmd[cmd.index("--model") + 1] == "anthropic/claude-sonnet-4-5"
+        assert "--variant" in cmd and "high" in cmd
+        # the style prompt rides on the message; the prompt is the LAST arg
+        assert cmd[-1].startswith("STYLE\n\n---\n\ndo it")
+        for flag in ("-p", "--permission-mode", "--append-system-prompt", "--add-dir"):
+            assert flag not in cmd
+
+    def test_opencode_without_style_prompt(self):
+        cfg = Config.from_env("o/1", env={"RALPH_AGENT": "opencode", "RALPH_WORKER_SYS": ""})
+        assert worker.WorkerRunner(cfg).command("/ws", "p")[-1] == "p"
+
+    def test_agent_bin_override_runs_kilo(self):
+        cfg = Config.from_env("o/1", env={"RALPH_AGENT": "opencode", "RALPH_AGENT_BIN": "kilo"})
+        cmd = worker.WorkerRunner(cfg).command("/ws", "p")
+        assert cmd[:3] == ["kilo", "run", "--auto"]
+
+    def test_legacy_extra_args_env_still_read(self):
+        cfg = Config.from_env("o/1", env={"RALPH_WORKER_EXTRA_ARGS": "--x"})
+        assert worker.WorkerRunner(cfg).command("/ws", "p")[-1] == "--x"
 
     def test_run_passes_through(self):
         calls = []
@@ -155,6 +182,11 @@ class TestPrompts:
     def test_rebase_forbids_abort(self):
         p = worker.rebase_resolve_prompt(self.B, self.T)
         assert "Do NOT run `git rebase --abort`" in p and "Do NOT push" in p
+
+    def test_opencode_prompts_name_the_skill_tool(self):
+        cfg = Config.from_env("o/1", env={"RALPH_AGENT": "opencode"})
+        p = worker.implement_prompt(cfg, self.K, self.N, "s", self.F, self.B, self.T)
+        assert "`tdd` skill (load it with the skill tool)" in p and "/tdd" not in p
 
     def test_skill_names_configurable(self):
         cfg = Config.from_env("o/1", env={"RALPH_SKILL_IMPLEMENT": "my-tdd",

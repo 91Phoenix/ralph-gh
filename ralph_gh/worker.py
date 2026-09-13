@@ -1,6 +1,12 @@
-"""Claude worker sessions (headless, permissions bypassed, run inside the
-ticket's workspace) and the BUILD_OK / BUILD_FAIL / .ralph-pr-body.md
-protocol between them and the orchestrator.
+"""Worker sessions (headless, permissions bypassed, run inside the ticket's
+workspace) and the BUILD_OK / BUILD_FAIL / .ralph-pr-body.md protocol between
+them and the orchestrator.
+
+Two agents can run a session, chosen with RALPH_AGENT:
+  claude   — `claude -p` (Claude Code), the default
+  opencode — `opencode run --auto` (OpenCode; RALPH_AGENT_BIN=kilo runs the
+             Kilo CLI, an OpenCode fork with the same flags)
+Both read skills from ~/.claude/skills, so the prompts name the same skills.
 
 Workers talk to GitHub with the `gh` CLI they inherit from the developer's
 shell — the same auth the loop itself uses. No MCP server is configured."""
@@ -199,13 +205,26 @@ class WorkerRunner:
         self.exec_fn = exec_fn or _exec
 
     def command(self, ws: str, prompt: str) -> List[str]:
-        cmd = ["claude", "-p", prompt, "--permission-mode", "bypassPermissions"]
-        if self.cfg.model:
-            cmd += ["--model", self.cfg.model]
-        if self.cfg.worker_sys:
-            cmd += ["--append-system-prompt", self.cfg.worker_sys]
+        cfg = self.cfg
+        extra = cfg.agent_extra.split()
+        if cfg.agent == "opencode":
+            # OpenCode has no --append-system-prompt: the style prompt rides
+            # at the top of the message. --auto approves every permission not
+            # explicitly denied, the headless equivalent of bypassPermissions.
+            cmd = [cfg.agent_command, "run", "--auto", "--dir", ws]
+            if cfg.model:
+                cmd += ["--model", cfg.model]
+            cmd += extra
+            if cfg.worker_sys:
+                prompt = f"{cfg.worker_sys}\n\n---\n\n{prompt}"
+            return cmd + [prompt]
+        cmd = [cfg.agent_command, "-p", prompt, "--permission-mode",
+               "bypassPermissions"]
+        if cfg.model:
+            cmd += ["--model", cfg.model]
+        if cfg.worker_sys:
+            cmd += ["--append-system-prompt", cfg.worker_sys]
         cmd += ["--add-dir", ws]
-        extra = os.environ.get("RALPH_WORKER_EXTRA_ARGS", "").split()
         return cmd + extra
 
     def env(self) -> dict:
@@ -235,9 +254,11 @@ def _ci_hint() -> str:
             "that exist, and run THE SAME commands locally")
 
 
-def _skill(name: str, what: str) -> str:
-    return (f"Use the /{name} skill for {what}; if that skill is not available "
-            f"in this session, follow the same discipline by hand")
+def _skill(cfg: Config, name: str, what: str) -> str:
+    how = (f"the `{name}` skill (load it with the skill tool)"
+           if cfg.agent == "opencode" else f"the /{name} skill")
+    return (f"Use {how} for {what}; if that skill is not available in this "
+            f"session, follow the same discipline by hand")
 
 
 def _markers(commit_msg: str, branch: str) -> str:
@@ -270,7 +291,7 @@ def implement_prompt(cfg: Config, key: str, number: int, summary: str,
         f"what you write and size it for real production volume, not the test "
         f"fixture. You may read the issue and its comments with "
         f"`gh issue view {number} --repo {key.split('#')[0]} --comments`.\n"
-        f"2. {_skill(cfg.skill_implement, 'test-first implementation (red-green-refactor) at sensible seams')}. "
+        f"2. {_skill(cfg, cfg.skill_implement, 'test-first implementation (red-green-refactor) at sensible seams')}. "
         f"Acceptance criteria describe one actor doing one thing; if the code "
         f"has a second writer in production (a poller, a job, a second "
         f"replica), write the red test for the race and make the write "
@@ -321,7 +342,7 @@ def pipeline_fix_prompt(cfg: Config, key: str, number: int, full: str,
         f"`gh pr checks {pr} --repo {full}` lists every check. "
         f"Legacy commit statuses show in `gh api repos/{full}/commits/$(git rev-parse HEAD)/status`.\n"
         f"2. Diagnose and fix the failure in this working copy. "
-        f"{_skill(cfg.skill_implement, 'any code change (pin the fix with a test)')}.\n"
+        f"{_skill(cfg, cfg.skill_implement, 'any code change (pin the fix with a test)')}.\n"
         f"3. {_ci_hint()}.\n"
         f"4. {_markers(f'fix(#{number}): make CI green', branch)} For BUILD_FAIL "
         f"the four lines are: which check failed, the decisive error line "
@@ -338,7 +359,7 @@ def review_prompt(cfg: Config, key: str, number: int, pr: str, full: str,
         f"checked-out code is in the working directory for context, and "
         f"`gh issue view {number} --repo {key.split('#')[0]}` gives the "
         f"acceptance criteria.\n"
-        f"2. {_skill(cfg.skill_review, 'concise, actionable findings: correctness, tests, fit against the acceptance criteria')}. "
+        f"2. {_skill(cfg, cfg.skill_review, 'concise, actionable findings: correctness, tests, fit against the acceptance criteria')}. "
         f"Skip pure style nits.\n"
         f"3. Post EACH finding as its own comment. For a finding tied to a "
         f"line use an inline review comment: `gh api repos/{full}/pulls/{pr}/comments "
@@ -368,7 +389,7 @@ def address_prompt(cfg: Config, key: str, number: int, pr: str, full: str,
         f"conversation comments via `gh pr comment {pr} --repo {full} --body '...'`. "
         f"Answer every comment one way or the other; replies in {_HUMAN_TEXT}. "
         f"`LGTM` needs no answer.\n"
-        f"3. {_skill(cfg.skill_implement, 'every code change (a fix arrives with the test that pins it)')}.\n"
+        f"3. {_skill(cfg, cfg.skill_implement, 'every code change (a fix arrives with the test that pins it)')}.\n"
         f"4. If you changed code: {_ci_hint()}, and then {_markers(f'fix(#{number}): address review', branch)} "
         f"If no code change was needed, do NOT create BUILD_OK."
     )
@@ -388,7 +409,7 @@ def resync_prompt(cfg: Config, key: str, number: int, pr: str, full: str,
         f"code or test on this branch that satisfies it. Anything you cannot "
         f"point at is the gap.\n"
         f"3. Close ONLY that gap, test-first "
-        f"({_skill(cfg.skill_implement, 'it')}). Do not refactor, do not "
+        f"({_skill(cfg, cfg.skill_implement, 'it')}). Do not refactor, do not "
         f"re-implement what already works, do not touch anything outside the "
         f"gap.\n"
         f"4. If there is no gap, change NOTHING and do not commit: post one "
@@ -405,7 +426,7 @@ def rebase_resolve_prompt(branch: str, target: str) -> str:
     return (
         f"You are in the middle of a `git rebase` of branch {branch} onto "
         f"{target} that has STOPPED on merge conflicts. Use the "
-        f"/resolving-merge-conflicts skill if it is available. Resolve every "
+        f"resolving-merge-conflicts skill if it is available. Resolve every "
         f"conflict preserving both sides' intent, stage the results and run "
         f"`git rebase --continue` until the rebase is FULLY complete (`git "
         f"status` shows no rebase in progress). Do NOT run `git rebase "

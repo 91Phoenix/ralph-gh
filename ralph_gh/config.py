@@ -72,6 +72,17 @@ def target_is_explicit(val: Optional[str]) -> bool:
     return bool(val)
 
 
+AGENTS = ("claude", "opencode")
+
+
+def _agent(val: str) -> str:
+    val = (val or "claude").strip().lower()
+    if val not in AGENTS:
+        raise ValueError(f"RALPH_AGENT must be one of {', '.join(AGENTS)}, "
+                         f"got {val!r}")
+    return val
+
+
 def _int(env: Mapping[str, str], name: str, default: int) -> int:
     try:
         return int(env.get(name, "") or default)
@@ -119,6 +130,9 @@ class Config:
     draft_prs: bool
 
     # Worker sessions
+    agent: str                  # "claude" | "opencode"
+    agent_bin: str              # binary to run ("" = the agent's own name)
+    agent_extra: str            # extra CLI flags for every session
     model: str
     worker_sys: str
     skill_implement: str
@@ -132,6 +146,13 @@ class Config:
     @property
     def log_dir(self) -> str:
         return os.path.join(self.workspace_base, ".logs")
+
+    @property
+    def agent_command(self) -> str:
+        """The executable that runs a worker session: the agent's own name
+        unless RALPH_AGENT_BIN points elsewhere (e.g. `kilo`, the OpenCode
+        fork, with RALPH_AGENT=opencode)."""
+        return self.agent_bin or self.agent
 
     @property
     def project_ref(self) -> str:
@@ -175,6 +196,10 @@ class Config:
             resync_grace=_int(env, "RALPH_RESYNC_GRACE", 600),
             rebase_resolve=env.get("RALPH_REBASE_RESOLVE", "1") == "1",
             draft_prs=env.get("RALPH_DRAFT_PRS", "1") == "1",
+            agent=_agent(env.get("RALPH_AGENT", "claude")),
+            agent_bin=env.get("RALPH_AGENT_BIN", ""),
+            agent_extra=env.get("RALPH_AGENT_EXTRA_ARGS",
+                                env.get("RALPH_WORKER_EXTRA_ARGS", "")),
             model=env.get("RALPH_MODEL", ""),
             worker_sys=env.get("RALPH_WORKER_SYS", DEFAULT_WORKER_SYS),
             skill_implement=env.get("RALPH_SKILL_IMPLEMENT", "tdd"),
