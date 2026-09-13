@@ -6,7 +6,7 @@ import pytest
 
 from ralph_gh.config import Config
 from ralph_gh.gitops import EXCLUDED_ARTIFACTS, GitOps
-from tests.test_gitrepo import commit, sh
+from tests.test_gitrepo import ENV, commit, sh
 
 KEY = "o/r#1"
 BRANCH = "feature/issue-1"
@@ -26,7 +26,12 @@ def origin(tmp_path):
 
 
 @pytest.fixture()
-def ops(tmp_path):
+def ops(tmp_path, monkeypatch):
+    # GitOps runs git with the process environment; a CI runner has no
+    # global identity, and a rebase creates commits.
+    for k in ("GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_NAME",
+              "GIT_COMMITTER_EMAIL"):
+        monkeypatch.setenv(k, ENV[k])
     cfg = Config.from_env("o/1", env={"RALPH_WORKSPACES": str(tmp_path / "w")})
     return GitOps(cfg)
 
