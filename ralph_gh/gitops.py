@@ -13,7 +13,8 @@ from .state import encode_key
 
 EXCLUDED_ARTIFACTS = (".ralph-ticket.md", ".ralph-siblings.md",
                       ".ralph-pr-body.md", ".ralph-pr-comments.md",
-                      "BUILD_OK", "BUILD_FAIL")
+                      ".ralph-collaudo/",
+                      "BUILD_OK", "BUILD_FAIL", "COLLAUDO_OK", "COLLAUDO_FAIL")
 
 
 @dataclass

@@ -83,6 +83,17 @@ def _agent(val: str) -> str:
     return val
 
 
+BROWSERS = ("playwright", "none")
+
+
+def _browser(val: str) -> str:
+    val = (val or "playwright").strip().lower()
+    if val not in BROWSERS:
+        raise ValueError(f"RALPH_COLLAUDO_BROWSER must be one of "
+                         f"{', '.join(BROWSERS)}, got {val!r}")
+    return val
+
+
 def _int(env: Mapping[str, str], name: str, default: int) -> int:
     try:
         return int(env.get(name, "") or default)
@@ -129,6 +140,17 @@ class Config:
     rebase_resolve: bool
     draft_prs: bool
 
+    # Collaudo — optional local acceptance run of each PR (review -> collaudo
+    # -> address). Off by default: it needs the app running locally.
+    collaudo: bool
+    collaudo_repos: str         # space-separated owner/repo or names; "" = all
+    collaudo_probe: str         # shell command that must exit 0 (app is up)
+    collaudo_url: str           # where the app answers; "" = from the PR recipe
+    collaudo_browser: str       # "playwright" | "none"
+    collaudo_agent: str         # agent for the collaudo session
+    collaudo_agent_bin: str
+    skill_collaudo: str
+
     # Worker sessions
     agent: str                  # "claude" | "opencode"
     agent_bin: str              # binary to run ("" = the agent's own name)
@@ -153,6 +175,10 @@ class Config:
         unless RALPH_AGENT_BIN points elsewhere (e.g. `kilo`, the OpenCode
         fork, with RALPH_AGENT=opencode)."""
         return self.agent_bin or self.agent
+
+    @property
+    def collaudo_agent_command(self) -> str:
+        return self.collaudo_agent_bin or self.collaudo_agent
 
     @property
     def project_ref(self) -> str:
@@ -196,6 +222,16 @@ class Config:
             resync_grace=_int(env, "RALPH_RESYNC_GRACE", 600),
             rebase_resolve=env.get("RALPH_REBASE_RESOLVE", "1") == "1",
             draft_prs=env.get("RALPH_DRAFT_PRS", "1") == "1",
+            collaudo=env.get("RALPH_COLLAUDO", "0") == "1",
+            collaudo_repos=env.get("RALPH_COLLAUDO_REPOS", ""),
+            collaudo_probe=env.get("RALPH_COLLAUDO_PROBE", ""),
+            collaudo_url=env.get("RALPH_COLLAUDO_URL", ""),
+            collaudo_browser=_browser(env.get("RALPH_COLLAUDO_BROWSER", "playwright")),
+            collaudo_agent=_agent(env.get("RALPH_COLLAUDO_AGENT",
+                                          env.get("RALPH_AGENT", "claude"))),
+            collaudo_agent_bin=env.get("RALPH_COLLAUDO_AGENT_BIN",
+                                       env.get("RALPH_AGENT_BIN", "")),
+            skill_collaudo=env.get("RALPH_SKILL_COLLAUDO", "collaudo-locale"),
             agent=_agent(env.get("RALPH_AGENT", "claude")),
             agent_bin=env.get("RALPH_AGENT_BIN", ""),
             agent_extra=env.get("RALPH_AGENT_EXTRA_ARGS",

@@ -16,6 +16,7 @@ import os
 import time
 from typing import Callable, List, Optional
 
+from . import collaudo as collaudo_mod
 from . import github as gh_mod
 from . import worker
 from .config import Config, resolve_target_branch, target_is_explicit
@@ -37,13 +38,15 @@ class Orchestrator:
     def __init__(self, cfg: Config, tracker, gh, ops, state, runner,
                  log: Optional[Callable[[str], None]] = None,
                  sleep: Callable[[float], None] = time.sleep,
-                 now: Callable[[], float] = time.time):
+                 now: Callable[[], float] = time.time,
+                 collaudo_runner=None):
         self.cfg = cfg
         self.tracker = tracker
         self.gh = gh
         self.ops = ops
         self.state = state
         self.runner = runner
+        self.collaudo_runner = collaudo_runner or runner
         self.log = log or (lambda m: print(f"[{time.strftime('%H:%M:%S')}] {m}",
                                            flush=True))
         self.sleep = sleep
@@ -134,12 +137,13 @@ class Orchestrator:
         return detail
 
     def _run_worker_retrying(self, ws: str, title: str, prompt: str,
-                             logf: str) -> str:
+                             logf: str, runner=None) -> str:
         """Run a worker session, retrying when it died on a retryable API
         error. A terminal failure is not retried — no attempt can get further.
         Returns "" when the session ended cleanly, else the error line."""
+        runner = runner or self.runner
         for attempt in range(1 + self.cfg.transient_retries):
-            self.runner.run(ws, title, prompt, logf)
+            runner.run(ws, title, prompt, logf)
             kind, line = worker.session_failure(logf)
             if kind == worker.CLEAN:
                 return ""
@@ -459,6 +463,9 @@ class Orchestrator:
             self.state.set(key, "state", "pr_open")
             return
 
+        # ---- Phase 2b: collaudo (findings become PR comments) ----
+        self.run_collaudo(key, number, pr, full, ws, branch)
+
         # ---- Phase 3: address ----
         worker.clear_markers(ws)
         worker.write_pr_comments(ws, self.gh.pr_comments_md(full, pr))
@@ -490,6 +497,45 @@ class Orchestrator:
                                   f"ready for a human to merge.")
         self.state.set(key, "state", "pr_open")
         self.log(f"{key}: pipeline complete — PR #{pr} awaits a human merge")
+
+    def run_collaudo(self, key: str, number: int, pr: str, full: str,
+                     ws: str, branch: str) -> None:
+        """Acceptance run of the open PR against the locally running app.
+        Nothing here can block the pipeline: a collaudo that could not run
+        leaves a comment saying a human should run it by hand."""
+        cfg = self.cfg
+        if not cfg.collaudo:
+            return
+        if not collaudo_mod.repo_applicable(cfg, full):
+            self.log(f"{key}: collaudo skipped — {full} not in RALPH_COLLAUDO_REPOS")
+            return
+        ok, why = collaudo_mod.availability(cfg)
+        if not ok:
+            self.log(f"{key}: collaudo skipped — {why}")
+            self.tracker.comment(
+                key, f"{TAG}: PR #{pr} was NOT collaudato locally — {why}. A "
+                     f"human should run the acceptance test by hand.")
+            return
+        worker.clear_collaudo_markers(ws)
+        logf = self._log_path(key, "collaudo")
+        self.log(f"{key}: collaudo session ({cfg.collaudo_agent}, browser="
+                 f"{cfg.collaudo_browser})")
+        err = self._run_worker_retrying(
+            ws, f"collaudo {key}",
+            worker.collaudo_prompt(cfg, key, number, pr, full, branch), logf,
+            runner=self.collaudo_runner)
+        summary = worker.collaudo_summary(ws)
+        if worker.collaudo_ok(ws):
+            self.log(f"{key}: collaudo complete — {summary}")
+            return
+        self.warn(f"{key}: collaudo did not run to completion"
+                  + (f": {summary}" if summary else ""))
+        detail = f" {summary}" if summary else self._failure_detail(err)
+        self.tracker.comment(
+            key, f"{TAG}: PR #{pr} is open and reviewed, but the automatic "
+                 f"local collaudo did not run to completion, so the PR is "
+                 f"untested against the running app.{detail} A human should "
+                 f"collaudare it manually. Log: {logf}")
 
     def _prepare(self, key: str, url: str, branch: str, target: str,
                  explicit: bool):

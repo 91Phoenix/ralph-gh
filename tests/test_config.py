@@ -60,6 +60,18 @@ class TestConfig:
         with pytest.raises(ValueError):
             Config.from_env("o/1", env={"RALPH_AGENT": "aider"})
 
+    def test_collaudo_knobs(self):
+        c = Config.from_env("o/1", env={})
+        assert not c.collaudo and c.collaudo_browser == "playwright"
+        assert c.collaudo_agent == "claude" and c.collaudo_agent_command == "claude"
+        c = Config.from_env("o/1", env={"RALPH_AGENT": "opencode", "RALPH_AGENT_BIN": "kilo",
+                                         "RALPH_COLLAUDO": "1"})
+        assert c.collaudo and c.collaudo_agent == "opencode" and c.collaudo_agent_command == "kilo"
+        c = Config.from_env("o/1", env={"RALPH_COLLAUDO_AGENT": "opencode"})
+        assert c.agent == "claude" and c.collaudo_agent == "opencode"
+        with pytest.raises(ValueError):
+            Config.from_env("o/1", env={"RALPH_COLLAUDO_BROWSER": "chrome"})
+
     def test_bad_int_falls_back(self):
         assert Config.from_env("o/1", env={"MAX_CONCURRENT": "x"}).max_concurrent == 2
 

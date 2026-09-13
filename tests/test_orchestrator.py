@@ -567,6 +567,79 @@ class TestRunPipeline:
 
 
 # ---------------------------------------------------------------------------
+# Collaudo
+# ---------------------------------------------------------------------------
+def collaudo_env(env, monkeypatch, **extra):
+    """The env fixture with the collaudo on and its gate answering yes."""
+    orch, tracker, gh, ops, state, runner = env
+    e = {"RALPH_WORKSPACES": orch.cfg.workspace_base, "CHECKS_POLL_WAIT": "0",
+         "RALPH_COLLAUDO": "1"}
+    e.update(extra)
+    orch.cfg = Config.from_env("o/1", env=e)
+    monkeypatch.setattr("ralph_gh.collaudo.availability", lambda cfg: (True, ""))
+    return orch, tracker, gh, ops, state, runner
+
+
+class TestCollaudo:
+    def test_runs_between_review_and_address_with_its_own_runner(self, env, monkeypatch):
+        orch, tracker, gh, ops, state, runner = collaudo_env(env, monkeypatch)
+        crunner = FakeRunner()
+        crunner.behavior["collaudo"] = write_marker("COLLAUDO_OK", "PASS\n- t1 ok")
+        orch.collaudo_runner = crunner
+        run(orch)
+        assert runner.sessions == [f"implement {KEY}", f"review {KEY}", f"address {KEY}"]
+        assert crunner.sessions == [f"collaudo {KEY}"]
+        assert "NOT collaudato" not in comments(tracker) and "untested" not in comments(tracker)
+        assert state.state_of(KEY) == "pr_open"
+
+    def test_issues_found_is_still_a_completed_collaudo(self, env, monkeypatch):
+        orch, tracker, _, _, _, runner = collaudo_env(env, monkeypatch)
+        runner.behavior["collaudo"] = write_marker("COLLAUDO_OK", "ISSUES 2\n- t1 fail")
+        run(orch)
+        assert "untested" not in comments(tracker) and tracker.labels == []
+
+    def test_collaudo_fail_comments_and_continues(self, env, monkeypatch):
+        orch, tracker, _, _, state, runner = collaudo_env(env, monkeypatch)
+        runner.behavior["collaudo"] = write_marker("COLLAUDO_FAIL", "no free slot")
+        run(orch)
+        assert "untested against the running app. no free slot" in comments(tracker)
+        assert f"address {KEY}" in runner.sessions and state.state_of(KEY) == "pr_open"
+        assert tracker.labels == []
+
+    def test_dead_collaudo_session_retried_then_reported(self, env, monkeypatch):
+        orch, tracker, _, _, _, runner = collaudo_env(env, monkeypatch)
+        runner.behavior["collaudo"] = no_marker("API Error: 529")
+        run(orch)
+        assert runner.sessions.count(f"collaudo {KEY}") == 2
+        assert "did not run to completion" in comments(tracker) and "529" in comments(tracker)
+
+    def test_unavailable_tells_human(self, env, monkeypatch):
+        orch, tracker, _, _, _, runner = collaudo_env(env, monkeypatch)
+        monkeypatch.setattr("ralph_gh.collaudo.availability",
+                            lambda cfg: (False, "the local app probe `curl` exited 7"))
+        run(orch)
+        assert f"collaudo {KEY}" not in runner.sessions
+        assert "NOT collaudato locally — the local app probe" in comments(tracker)
+
+    def test_inapplicable_repo_skips_silently(self, env, monkeypatch):
+        orch, tracker, _, _, _, runner = collaudo_env(env, monkeypatch,
+                                                      RALPH_COLLAUDO_REPOS="other")
+        run(orch)
+        assert f"collaudo {KEY}" not in runner.sessions and "collaudato" not in comments(tracker)
+
+    def test_disabled_by_default_is_silent(self, env):
+        orch, tracker, _, _, _, runner = env
+        run(orch)
+        assert f"collaudo {KEY}" not in runner.sessions and "collaudato" not in comments(tracker)
+
+    def test_not_run_when_review_posted_nothing(self, env, monkeypatch):
+        orch, _, gh, _, _, runner = collaudo_env(env, monkeypatch)
+        gh.comment_counts = [0]
+        run(orch)
+        assert f"collaudo {KEY}" not in runner.sessions
+
+
+# ---------------------------------------------------------------------------
 # PR state truth, merges, sibling rebases
 # ---------------------------------------------------------------------------
 def pr_open_state(state, key, full=FULL, branch=None, target="main", pr="7"):

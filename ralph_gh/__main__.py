@@ -148,6 +148,12 @@ def main(argv=None) -> int:
     log(f"Agent: {cfg.agent} ({cfg.agent_command}) | "
         f"Model: {cfg.model or '(CLI default)'} | Draft PRs: {cfg.draft_prs} | "
         f"Resync: {cfg.resync} | Workspaces: {cfg.workspace_base}")
+    if cfg.collaudo:
+        log(f"Collaudo: on — agent {cfg.collaudo_agent} ({cfg.collaudo_agent_command}), "
+            f"browser {cfg.collaudo_browser}, repos [{cfg.collaudo_repos or 'all'}], "
+            f"probe {cfg.collaudo_probe or 'none'}")
+    else:
+        log("Collaudo: off (RALPH_COLLAUDO=1 enables the local acceptance run)")
     log("================")
 
     def running() -> int:

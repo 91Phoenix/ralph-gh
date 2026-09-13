@@ -11,6 +11,7 @@ Both read skills from ~/.claude/skills, so the prompts name the same skills.
 Workers talk to GitHub with the `gh` CLI they inherit from the developer's
 shell — the same auth the loop itself uses. No MCP server is configured."""
 
+import json
 import os
 import re
 import signal
@@ -24,6 +25,14 @@ from .config import Config
 # (see gitops.EXCLUDED_ARTIFACTS) so no worker can commit it.
 PR_BODY = ".ralph-pr-body.md"
 PR_COMMENTS = ".ralph-pr-comments.md"
+COLLAUDO_DIR = ".ralph-collaudo"     # screenshots + esiti of the collaudo run
+
+# The collaudo phase's markers, mirroring BUILD_OK/BUILD_FAIL: COLLAUDO_OK
+# means the collaudo RAN TO COMPLETION (its first line is PASS or ISSUES <n>
+# — failing tests are findings on the PR, not a failure of the collaudo);
+# COLLAUDO_FAIL means it could not run (app down, no browser) and says why.
+COLLAUDO_OK = "COLLAUDO_OK"
+COLLAUDO_FAIL = "COLLAUDO_FAIL"
 TICKET = ".ralph-ticket.md"
 SIBLINGS = ".ralph-siblings.md"
 
@@ -119,6 +128,31 @@ def pr_body(ws: str) -> str:
     return txt
 
 
+def collaudo_ok(ws: str) -> bool:
+    return os.path.isfile(os.path.join(ws, COLLAUDO_OK))
+
+
+def collaudo_failed(ws: str) -> bool:
+    return os.path.isfile(os.path.join(ws, COLLAUDO_FAIL))
+
+
+def clear_collaudo_markers(ws: str) -> None:
+    for name in (COLLAUDO_OK, COLLAUDO_FAIL):
+        try:
+            os.unlink(os.path.join(ws, name))
+        except OSError:
+            pass
+
+
+def collaudo_summary(ws: str) -> str:
+    """One line from whichever marker exists (OK first)."""
+    for name in (COLLAUDO_OK, COLLAUDO_FAIL):
+        path = os.path.join(ws, name)
+        if os.path.isfile(path):
+            return _one_line(path, 600, f"… (truncated, full text in {path})")
+    return ""
+
+
 def write_pr_comments(ws: str, md: str) -> None:
     path = os.path.join(ws, PR_COMMENTS)
     if md:
@@ -199,45 +233,96 @@ def _exec(cmd: List[str], cwd: str, logf: str, timeout: int,
             return 124
 
 
+def playwright_mcp_server(ws: str) -> dict:
+    """The Playwright MCP server definition every agent understands: a local
+    process, screenshots straight into the workspace's collaudo directory."""
+    return {"command": "npx",
+            "args": ["-y", "@playwright/mcp@latest", "--output-dir",
+                     os.path.join(ws, COLLAUDO_DIR)]}
+
+
 class WorkerRunner:
-    def __init__(self, cfg: Config, exec_fn: Optional[Callable] = None):
+    """Runs one agent session. `profile` picks the agent: "worker" (the
+    implement/review/address/resync sessions, RALPH_AGENT) or "collaudo"
+    (the acceptance run, RALPH_COLLAUDO_AGENT, plus the Playwright MCP
+    browser when RALPH_COLLAUDO_BROWSER=playwright)."""
+
+    def __init__(self, cfg: Config, exec_fn: Optional[Callable] = None,
+                 profile: str = "worker"):
         self.cfg = cfg
         self.exec_fn = exec_fn or _exec
+        self.profile = profile
+
+    @property
+    def agent(self) -> str:
+        return self.cfg.collaudo_agent if self.profile == "collaudo" else self.cfg.agent
+
+    @property
+    def agent_command(self) -> str:
+        return (self.cfg.collaudo_agent_command if self.profile == "collaudo"
+                else self.cfg.agent_command)
+
+    @property
+    def browser(self) -> bool:
+        return self.profile == "collaudo" and self.cfg.collaudo_browser == "playwright"
+
+    def _mcp_config_file(self, ws: str) -> str:
+        path = os.path.join(ws, COLLAUDO_DIR, "mcp-config.json")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as f:
+            json.dump({"mcpServers": {"playwright": playwright_mcp_server(ws)}}, f)
+        return path
 
     def command(self, ws: str, prompt: str) -> List[str]:
         cfg = self.cfg
         extra = cfg.agent_extra.split()
-        if cfg.agent == "opencode":
+        if self.agent == "opencode":
             # OpenCode has no --append-system-prompt: the style prompt rides
             # at the top of the message. --auto approves every permission not
             # explicitly denied, the headless equivalent of bypassPermissions.
-            cmd = [cfg.agent_command, "run", "--auto", "--dir", ws]
+            # The browser (Playwright MCP) arrives through the environment,
+            # see env().
+            cmd = [self.agent_command, "run", "--auto", "--dir", ws]
             if cfg.model:
                 cmd += ["--model", cfg.model]
             cmd += extra
             if cfg.worker_sys:
                 prompt = f"{cfg.worker_sys}\n\n---\n\n{prompt}"
             return cmd + [prompt]
-        cmd = [cfg.agent_command, "-p", prompt, "--permission-mode",
+        cmd = [self.agent_command, "-p", prompt, "--permission-mode",
                "bypassPermissions"]
         if cfg.model:
             cmd += ["--model", cfg.model]
         if cfg.worker_sys:
             cmd += ["--append-system-prompt", cfg.worker_sys]
         cmd += ["--add-dir", ws]
+        if self.browser:
+            cmd += ["--mcp-config", self._mcp_config_file(ws)]
         return cmd + extra
 
-    def env(self) -> dict:
+    def env(self, ws: str = "") -> dict:
         env = dict(os.environ)
         env["RALPH_GH"] = "1"
         # A worker must never inherit an interactive-only setting that makes
         # `claude -p` wait on a terminal.
         env.pop("CLAUDE_CODE_ENTRYPOINT", None)
+        if self.browser and self.agent == "opencode" and ws:
+            # Inline config merges over opencode.json / kilo.json; the Kilo
+            # CLI is an OpenCode fork, so both spellings are set.
+            srv = playwright_mcp_server(ws)
+            content = json.dumps({"mcp": {"playwright": {
+                "type": "local", "command": [srv["command"]] + srv["args"]}}})
+            env["OPENCODE_CONFIG_CONTENT"] = content
+            env["KILO_CONFIG_CONTENT"] = content
+        if self.profile == "collaudo":
+            env["COLLAUDO_DIR"] = os.path.join(ws, COLLAUDO_DIR) if ws else COLLAUDO_DIR
+            if self.cfg.collaudo_url:
+                env["COLLAUDO_URL"] = self.cfg.collaudo_url
         return env
 
     def run(self, ws: str, title: str, prompt: str, logf: str) -> int:
         return self.exec_fn(self.command(ws, prompt), ws, logf,
-                            self.cfg.session_timeout, self.env())
+                            self.cfg.session_timeout, self.env(ws))
 
 
 # ---------------------------------------------------------------------------
@@ -389,6 +474,12 @@ def address_prompt(cfg: Config, key: str, number: int, pr: str, full: str,
         f"conversation comments via `gh pr comment {pr} --repo {full} --body '...'`. "
         f"Answer every comment one way or the other; replies in {_HUMAN_TEXT}. "
         f"`LGTM` needs no answer.\n"
+        f"   Comments prefixed `collaudo:` are findings of the automatic "
+        f"acceptance run against the locally running app — observed behaviour "
+        f"of the RUNNING system, with the reproduction in the comment. Treat "
+        f"each as a bug to fix (or explain), and when you fix one, cover the "
+        f"observed failure with a test so the fix is pinned without re-running "
+        f"the app. The closing `collaudo: esiti` comment needs no answer.\n"
         f"3. {_skill(cfg, cfg.skill_implement, 'every code change (a fix arrives with the test that pins it)')}.\n"
         f"4. If you changed code: {_ci_hint()}, and then {_markers(f'fix(#{number}): address review', branch)} "
         f"If no code change was needed, do NOT create BUILD_OK."
@@ -419,6 +510,82 @@ def resync_prompt(cfg: Config, key: str, number: int, pr: str, full: str,
         f"5. If you changed code: {_ci_hint()}, and then "
         f"{_markers(f'fix(#{number}): resync with the updated issue', branch)} "
         f"Do NOT rebase onto another branch."
+    )
+
+
+def collaudo_prompt(cfg: Config, key: str, number: int, pr: str, full: str,
+                    branch: str) -> str:
+    skill = (f"the `{cfg.skill_collaudo}` skill (load it with the skill tool)"
+             if cfg.collaudo_agent == "opencode" else f"the /{cfg.skill_collaudo} skill")
+    if cfg.collaudo_browser == "playwright":
+        browser = (
+            "The browser is the Playwright MCP server, already wired into this "
+            "session: `browser_navigate` to a URL, `browser_snapshot` for the "
+            "accessibility tree (its refs are the click targets — no pixel "
+            "coordinates), `browser_click` / `browser_type` by ref, "
+            "`browser_take_screenshot` WITH a `filename` (it lands in "
+            f"{COLLAUDO_DIR}/), `browser_network_requests` and "
+            "`browser_network_request` for payloads, `browser_console_messages` "
+            "for the console. Log in at the start: the profile is fresh. If the "
+            "browser tools are absent from this session, run the API-level "
+            f"collaudo below and say so in {COLLAUDO_OK}.")
+    else:
+        browser = ("This session has NO browser (RALPH_COLLAUDO_BROWSER=none): "
+                   "run the API-level collaudo — drive the states, then verify "
+                   "every expectation through the routes the PR changes with "
+                   "curl and judge pass/fail from the payloads.")
+    where = (f"The app answers at {cfg.collaudo_url} (RALPH_COLLAUDO_URL); "
+             f"do not start another copy."
+             if cfg.collaudo_url else
+             "Bring the app up with the commands the PR's recipe and the repo "
+             "itself provide (Makefile, docker-compose.yml, package.json "
+             "scripts); start only what the PR touches, on a port of your own.")
+    return (
+        f"Run a local collaudo — an acceptance test against the RUNNING app — "
+        f"of pull request #{pr} in {full} (issue {key}). The working copy is "
+        f"on {branch}. You are TESTING, not fixing: change no code, commit "
+        f"nothing, push nothing.\n\n"
+        f"1. Read the PR (`gh pr view {pr} --repo {full} --json body,title -q "
+        f".body`), above all its `## How to test manually` recipe, and the "
+        f"issue's acceptance criteria (`gh issue view {number} --repo "
+        f"{key.split('#')[0]}`). Name every test you are about to run and the "
+        f"state each one needs before you start.\n"
+        f"2. Follow {skill} step by step if it is available — it holds the "
+        f"slot discipline, the state recipes and the evidence rules; this "
+        f"prompt is the short form. {where}\n"
+        f"3. Drive the backend states each test needs through the app's own "
+        f"API or the recipe's commands; prefer the real writers over direct "
+        f"DB edits. {browser} Reach deep screens by direct URL. Decide every "
+        f"pass/fail from something you saw on screen or in a payload — never "
+        f"from the code looking right.\n"
+        f"4. Evidence: one screenshot per verified expectation, saved as a "
+        f"file under {COLLAUDO_DIR}/ named for the test it proves "
+        f"(`03-message-when-probe-already-assigned.png`), plus the crop of the "
+        f"element under test when the full page is too small to read.\n"
+        f"5. For EACH issue the collaudo surfaces (wrong payload, mishandled "
+        f"state, acceptance criterion not met) post ONE separate comment on "
+        f"the PR (`gh pr comment {pr} --repo {full} --body '...'`) prefixed "
+        f"`collaudo: `, in {_HUMAN_TEXT}, with the exact reproduction (route, "
+        f"state recipe, account) and observed vs expected; each comment must "
+        f"stand alone — a later session fixes them one by one. When every "
+        f"test passes, post one comment `collaudo: local acceptance run "
+        f"passed.` followed by the esiti (one line per test: what was "
+        f"verified and how). When some fail, still close with a `collaudo: "
+        f"esiti` comment carrying the full one-line-per-test table. Name the "
+        f"screenshot files in the esiti; they are on the tester's machine, "
+        f"not on GitHub.\n"
+        f"6. Reverse any write your tests needed, and ALWAYS release the slot "
+        f"and kill every process you started (dev server, tunnels) — also on "
+        f"failure.\n"
+        f"7. You are NOT finished until exactly one of these two files exists "
+        f"at the repo root; the orchestrator reads ONLY them. Write "
+        f"{COLLAUDO_OK} when the collaudo RAN TO COMPLETION: first line `PASS` "
+        f"or `ISSUES <n>` (n = findings posted), then one line per test with "
+        f"its esito — failing tests are PR findings, not a reason for "
+        f"{COLLAUDO_FAIL}. Write {COLLAUDO_FAIL} only when the collaudo could "
+        f"NOT run (app would not start, no free slot, the PR's surface cannot "
+        f"be exercised locally): {_HUMAN_TEXT} — what blocked you, the single "
+        f"most decisive error line verbatim, what a human must do."
     )
 
 

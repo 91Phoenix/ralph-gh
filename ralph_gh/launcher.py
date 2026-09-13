@@ -26,7 +26,8 @@ def build_orchestrator(cfg: Config) -> Orchestrator:
                       cfg.project_number, cfg.needs_human_label, log=log)
     state = StateStore(cfg.state_dir, cfg.project_ref)
     return Orchestrator(cfg, tracker, gh, GitOps(cfg), state,
-                        WorkerRunner(cfg), log=log)
+                        WorkerRunner(cfg), log=log,
+                        collaudo_runner=WorkerRunner(cfg, profile="collaudo"))
 
 
 def child_pipeline(cfg: Config, key: str, summary: str, repoval: str,

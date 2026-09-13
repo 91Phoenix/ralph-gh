@@ -42,6 +42,19 @@ class TestMarkers:
         worker.clear_pr_body(str(tmp_path))
         assert worker.pr_body(str(tmp_path)) == ""
 
+    def test_collaudo_markers_and_summary(self, tmp_path):
+        ws = str(tmp_path)
+        assert not worker.collaudo_ok(ws) and not worker.collaudo_failed(ws)
+        assert worker.collaudo_summary(ws) == ""
+        w(tmp_path, "COLLAUDO_FAIL", "no slot\nfree")
+        assert worker.collaudo_failed(ws) and worker.collaudo_summary(ws) == "no slot free"
+        w(tmp_path, "COLLAUDO_OK", "ISSUES 2\n- t1 pass\n- t2 fail")
+        assert worker.collaudo_summary(ws).startswith("ISSUES 2")   # OK wins
+        worker.clear_collaudo_markers(ws)
+        assert not worker.collaudo_ok(ws) and not worker.collaudo_failed(ws)
+        w(tmp_path, "BUILD_OK", "x"); worker.clear_collaudo_markers(ws)
+        assert worker.build_ok(ws)                                   # orthogonal
+
     def test_pr_comments_written_or_removed(self, tmp_path):
         worker.write_pr_comments(str(tmp_path), "# c")
         assert os.path.exists(tmp_path / worker.PR_COMMENTS)
@@ -135,6 +148,43 @@ class TestRunner:
         cmd = worker.WorkerRunner(cfg).command("/ws", "p")
         assert cmd[:3] == ["kilo", "run", "--auto"]
 
+    def test_collaudo_profile_claude_gets_playwright_mcp_config(self, tmp_path):
+        cfg = Config.from_env("o/1", env={"RALPH_COLLAUDO": "1"})
+        r = worker.WorkerRunner(cfg, profile="collaudo")
+        ws = str(tmp_path)
+        cmd = r.command(ws, "p")
+        assert cmd[0] == "claude" and "--mcp-config" in cmd
+        import json
+        conf = json.load(open(cmd[cmd.index("--mcp-config") + 1]))
+        srv = conf["mcpServers"]["playwright"]
+        assert srv["command"] == "npx" and "@playwright/mcp@latest" in srv["args"]
+        assert srv["args"][srv["args"].index("--output-dir") + 1] == os.path.join(ws, worker.COLLAUDO_DIR)
+        env = r.env(ws)
+        assert env["COLLAUDO_DIR"].endswith(worker.COLLAUDO_DIR) and "OPENCODE_CONFIG_CONTENT" not in env
+
+    def test_collaudo_profile_opencode_gets_inline_mcp(self, tmp_path):
+        cfg = Config.from_env("o/1", env={"RALPH_AGENT": "claude", "RALPH_COLLAUDO_AGENT": "opencode",
+                                           "RALPH_COLLAUDO_AGENT_BIN": "kilo",
+                                           "RALPH_COLLAUDO_URL": "http://localhost:3000"})
+        r = worker.WorkerRunner(cfg, profile="collaudo")
+        cmd = r.command(str(tmp_path), "p")
+        assert cmd[:3] == ["kilo", "run", "--auto"] and "--mcp-config" not in cmd
+        env = r.env(str(tmp_path))
+        import json
+        for var in ("OPENCODE_CONFIG_CONTENT", "KILO_CONFIG_CONTENT"):
+            mcp = json.loads(env[var])["mcp"]["playwright"]
+            assert mcp["type"] == "local" and mcp["command"][:3] == ["npx", "-y", "@playwright/mcp@latest"]
+        assert env["COLLAUDO_URL"] == "http://localhost:3000"
+        # the worker profile of the same config is untouched
+        assert worker.WorkerRunner(cfg).command(str(tmp_path), "p")[0] == "claude"
+
+    def test_collaudo_browser_none_wires_nothing(self, tmp_path):
+        cfg = Config.from_env("o/1", env={"RALPH_COLLAUDO_BROWSER": "none",
+                                           "RALPH_COLLAUDO_AGENT": "opencode"})
+        r = worker.WorkerRunner(cfg, profile="collaudo")
+        assert "--mcp-config" not in r.command(str(tmp_path), "p")
+        assert "OPENCODE_CONFIG_CONTENT" not in r.env(str(tmp_path))
+
     def test_legacy_extra_args_env_still_read(self):
         cfg = Config.from_env("o/1", env={"RALPH_WORKER_EXTRA_ARGS": "--x"})
         assert worker.WorkerRunner(cfg).command("/ws", "p")[-1] == "--x"
@@ -178,6 +228,28 @@ class TestPrompts:
         p = worker.resync_prompt(CFG, self.K, self.N, "3", self.F, self.B, "the issue was edited")
         assert "Close ONLY that gap" in p and "the issue was edited" in p
         assert "Do NOT rebase" in p
+
+    def test_collaudo_prompt_playwright(self):
+        cfg = Config.from_env("o/1", env={"RALPH_COLLAUDO": "1"})
+        p = worker.collaudo_prompt(cfg, self.K, self.N, "3", self.F, self.B)
+        for s in ("TESTING, not fixing", "browser_take_screenshot", "browser_snapshot",
+                  "COLLAUDO_OK", "COLLAUDO_FAIL", "ISSUES <n>", "collaudo: ",
+                  "gh pr comment 3 --repo o/r", "/collaudo-locale", "release the slot",
+                  "gh pr view 3 --repo o/r"):
+            assert s in p, s
+
+    def test_collaudo_prompt_api_level_and_opencode(self):
+        cfg = Config.from_env("o/1", env={"RALPH_COLLAUDO_BROWSER": "none",
+                                           "RALPH_COLLAUDO_AGENT": "opencode",
+                                           "RALPH_COLLAUDO_URL": "http://localhost:3000"})
+        p = worker.collaudo_prompt(cfg, self.K, self.N, "3", self.F, self.B)
+        assert "NO browser" in p and "browser_snapshot" not in p
+        assert "`collaudo-locale` skill (load it with the skill tool)" in p
+        assert "answers at http://localhost:3000" in p
+
+    def test_address_prompt_explains_collaudo_comments(self):
+        p = worker.address_prompt(CFG, self.K, self.N, "3", self.F, self.B)
+        assert "prefixed `collaudo:`" in p and "cover the observed failure with a test" in p
 
     def test_rebase_forbids_abort(self):
         p = worker.rebase_resolve_prompt(self.B, self.T)

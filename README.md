@@ -34,9 +34,10 @@ GitHub Issues + GitHub Projects.
   the gh credential helper (`gh auth setup-git`) or an SSH key that works
   non-interactively. The loop clones and pushes as you; it never embeds a
   token in a remote URL.
-- Optional: the skills the worker prompts refer to (`/tdd`, `/code-review`)
-  installed in `~/.claude/skills/`. See [skills/](skills/README.md). Workers
-  are told to follow the same discipline by hand when a skill is missing.
+- Optional: the skills the worker prompts refer to (`/tdd`, `/code-review`,
+  `/collaudo-locale`) installed in `~/.claude/skills/` — the last one ships
+  in [skills/](skills/README.md), link it in. Workers are told to follow the
+  same discipline by hand when a skill is missing.
 
 ## Set up the project once
 
@@ -137,8 +138,16 @@ review comments the address session reads), `BUILD_OK` / `BUILD_FAIL`.
 6. **Mark ready for review**, then a *review* session posts each finding as
    its own PR comment (`LGTM — no blocking issues.` when there are none). A
    review that posts nothing is reported honestly as UNREVIEWED.
-7. **Address.** One session works through every comment: fix it (with a test)
-   or reply why not; code changes are pushed and re-verified.
+6b. **Collaudo** (opt-in, `RALPH_COLLAUDO=1`): an acceptance run of the PR
+   against the app running locally, following the shipped
+   [`collaudo-locale`](skills/collaudo-locale/SKILL.md) skill — drive the
+   states the PR's screens need, walk the UI in a real browser, judge every
+   expectation from the screen or the payload. Findings land as `collaudo:`
+   PR comments; the next phase fixes them together with the review. See
+   [Collaudo](#collaudo-acceptance-run-against-the-local-app).
+7. **Address.** One session works through every comment — review findings
+   and `collaudo:` findings alike: fix it (with a test) or reply why not;
+   code changes are pushed and re-verified.
 8. **Done for the agent.** Comment "ready for a human to merge". The PR is
    yours.
 
@@ -190,6 +199,45 @@ the same `run --auto` interface, so `RALPH_AGENT=opencode RALPH_AGENT_BIN=kilo`
 runs the workers on Kilo; it reads `kilo.json`, not `opencode.json`.
 Anything else — `gh`, git, the markers, the pipeline — is agent-agnostic. The
 preflight checks that whichever binary you picked is on `PATH`.
+
+## Collaudo: acceptance run against the local app
+
+Headless sessions cannot load the Claude-in-Chrome extension, so the
+collaudo's browser is the **Playwright MCP server** (`@playwright/mcp`, needs
+`npx`), which every agent can load: Claude Code through a `--mcp-config` the
+runner writes, OpenCode and the Kilo CLI through inline config
+(`OPENCODE_CONFIG_CONTENT` / `KILO_CONFIG_CONTENT`). Screenshots are written
+to `.ralph-collaudo/` in the workspace (git-excluded); esiti go on the PR.
+
+```bash
+export RALPH_COLLAUDO=1
+export RALPH_COLLAUDO_PROBE='curl -fsS http://localhost:3000/health'   # app must be up
+export RALPH_COLLAUDO_URL=http://localhost:3000                        # tell the worker where
+export RALPH_COLLAUDO_AGENT=opencode RALPH_COLLAUDO_AGENT_BIN=kilo     # e.g. Kilo drives the browser
+ralph-gh <you>/3
+```
+
+| Var | Default | Meaning |
+|-----|---------|---------|
+| `RALPH_COLLAUDO` | `0` | `1` turns the phase on |
+| `RALPH_COLLAUDO_REPOS` | *(all)* | space-separated repos the local environment runs; others skip silently |
+| `RALPH_COLLAUDO_PROBE` | *(none)* | shell command that must exit 0 before a session is spent (the app is up) |
+| `RALPH_COLLAUDO_URL` | *(from the PR recipe)* | where the app answers; set it and the worker starts nothing |
+| `RALPH_COLLAUDO_BROWSER` | `playwright` | `playwright` (real UI walk) or `none` (API-level collaudo with curl) |
+| `RALPH_COLLAUDO_AGENT` / `RALPH_COLLAUDO_AGENT_BIN` | *(= `RALPH_AGENT` / `RALPH_AGENT_BIN`)* | run the collaudo on a different agent than the workers — Claude workers, Kilo collaudo, say |
+| `RALPH_SKILL_COLLAUDO` | `collaudo-locale` | the skill the prompt names; link `skills/collaudo-locale` into `~/.claude/skills` |
+
+The gate is orchestrator-side and cheap: disabled, repo not listed, agent or
+`npx` missing, probe failing — each skips the session and (except the first
+two) leaves an issue comment saying the PR was **not** collaudato and why. A
+collaudo session ends with `COLLAUDO_OK` (`PASS` or `ISSUES <n>`; failing
+tests are PR findings, not a failed collaudo) or `COLLAUDO_FAIL` (it could not
+run: no slot, app down); the latter is reported on the issue and the pipeline
+continues. Nothing in this phase can block a PR.
+
+Concurrent collaudi share one machine, so the skill claims a **slot** (app
+port, tunnel port, optional test account from `COLLAUDO_ACCOUNTS`) through
+`skills/collaudo-locale/scripts/collaudo-slot.sh`.
 
 ## Configuration
 
@@ -250,13 +298,13 @@ next poll and closes its issue instead of being rebased.
 ## Development
 
 ```bash
-uv run --group dev pytest -q      # 211 tests, no network, real git repos in tmp
+uv run --group dev pytest -q      # no network, real git repos in tmp
 ```
 
 `ralph_gh/` layout: `config` (env knobs) · `text` (issue-body parsing) ·
 `github` (gh CLI runner + REST/GraphQL shapes) · `tracker` (Project-backed
 tracker facade) · `frontier` (readiness) · `gitrepo` / `gitops` (git and the
 branch-base invariants) · `worker` (sessions, markers, prompts) ·
-`orchestrator` (the pipeline) · `launcher` / `__main__` (wiring, preflight,
-poll loop). Tests fake every collaborator and a conformance test pins the
+`collaudo` (the acceptance-run gate) · `orchestrator` (the pipeline) ·
+`launcher` / `__main__` (wiring, preflight, poll loop). Tests fake every collaborator and a conformance test pins the
 fakes to the real classes' method sets.
