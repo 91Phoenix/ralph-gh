@@ -105,13 +105,21 @@ def _pid_alive(pid: str) -> bool:
 
 
 def _kill_pid(pid: str) -> None:
+    """SIGTERM a pipeline. A spawned pipeline shares the loop's own process
+    group, so signalling its group would take the loop down with it; the
+    child kills its worker session (own session) from its signal handler."""
     try:
-        os.killpg(os.getpgid(int(pid)), signal.SIGTERM)
+        target = int(pid)
+        if os.getpgid(target) != os.getpgrp():
+            os.killpg(os.getpgid(target), signal.SIGTERM)
+        else:
+            os.kill(target, signal.SIGTERM)
     except (OSError, ValueError):
-        try:
-            os.kill(int(pid), signal.SIGTERM)
-        except (OSError, ValueError):
-            pass
+        pass
+
+
+class _Stop(Exception):
+    """Raised by the SIGTERM handler so the loop shuts down like on Ctrl-C."""
 
 
 # ---------------------------------------------------------------------------
@@ -159,7 +167,52 @@ def main(argv=None) -> int:
     def running() -> int:
         return state.count_running(_pid_alive)
 
+    def _raise_stop(signum, frame):
+        raise _Stop()
+
+    signal.signal(signal.SIGTERM, _raise_stop)
+
+    def shutdown(reason: str) -> None:
+        """Kill live pipelines, then give their tickets back: a stopped loop
+        must leave the project as it found it, not In Progress and assigned
+        to nobody who is working."""
+        log(f"=== {reason} — shutting down ===")
+        live = [k for k in state.owned_keys()
+                if state.get(k, "pid") and _pid_alive(state.get(k, "pid"))]
+        for key in live:
+            warn(f"killing {key} ({state.get(key, 'pid')})")
+            _kill_pid(state.get(key, "pid"))
+        for key in live:
+            _wait_dead(state.get(key, "pid"))
+        for key in state.owned_keys():
+            if state.state_of(key) != "running":
+                continue
+            try:
+                orch.release_claim(key, "the loop was stopped")
+            except Exception as e:
+                warn(f"{key}: could not release the claim "
+                     f"({e.__class__.__name__}: {e}) — reset it by hand")
+        log("Done.")
+
     first = True
+    try:
+        _poll_loop(cfg, orch, state, ctx, procs, deadline, data, first, running)
+    except (KeyboardInterrupt, _Stop):
+        shutdown("Interrupted")
+        return 130
+    shutdown("Time limit reached")
+    return 0
+
+
+def _wait_dead(pid: str, seconds: float = 15.0) -> None:
+    """A killed pipeline may be mid-commit; give it a moment to go before
+    its workspace is read or its ticket released."""
+    end = time.time() + seconds
+    while time.time() < end and _pid_alive(pid):
+        time.sleep(0.2)
+
+
+def _poll_loop(cfg, orch, state, ctx, procs, deadline, data, first, running):
     while time.time() < deadline:
         # Every poll step is network-facing; a blip must cost one poll, not
         # the loop (and never a needs-human ticket).
@@ -182,7 +235,13 @@ def main(argv=None) -> int:
                     warn(f"{key}: pipeline exceeded the watchdog ({age}s) — "
                          "killing")
                     _kill_pid(pid)
-                    state.set(key, "state", "failed")
+                    _wait_dead(pid)
+                    orch.release_claim(key, "the pipeline exceeded the watchdog")
+
+            # 2b. release tickets a previous run left claimed: their
+            #     pipeline died with it and would otherwise idle for ever
+            for key in orch.reclaim_orphans(_pid_alive):
+                log(f"  released {key}: claimed by an interrupted run")
 
             # 3. fetch the frontier (the preflight already fetched one)
             log(f"Polling frontier ({running()}/{cfg.max_concurrent} "
@@ -238,15 +297,6 @@ def main(argv=None) -> int:
         log(f"Sleeping {cfg.poll_seconds}s ({running()}/{cfg.max_concurrent} "
             "running)...")
         time.sleep(cfg.poll_seconds)
-
-    log("=== Time limit reached — shutting down ===")
-    for key in state.owned_keys():
-        pid = state.get(key, "pid")
-        if pid and _pid_alive(pid):
-            warn(f"killing {key} ({pid})")
-            _kill_pid(pid)
-    log("Done.")
-    return 0
 
 
 if __name__ == "__main__":

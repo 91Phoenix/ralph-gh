@@ -188,7 +188,17 @@ Meanwhile, every poll (`POLL_SECONDS`, default 5 min):
 - **Idle is explained.** When nothing is grabbable, one log line per open
   item says why (`status=In Progress`, `no ready-for-agent label`,
   `blocked-by acme/app#3`, `assigned:you`).
-- **A watchdog** kills a pipeline that has run for `3 × SESSION_TIMEOUT`.
+- **A watchdog** kills a pipeline that has run for `3 × SESSION_TIMEOUT`
+  and releases its ticket like any other interruption.
+- **Interrupted pipelines are released.** A pipeline whose process is gone
+  without a verdict (the previous run was stopped with Ctrl-C, crashed, or
+  the machine rebooted) has left its ticket In Progress and assigned, which
+  the frontier would otherwise read as "somebody is on it" for ever. The
+  poll gives it back: with a PR open the loop simply resumes tracking it;
+  without one the ticket returns to Ready, unassigned, and any committed but
+  unpushed work is pushed to the branch first so nothing is lost. Each
+  interruption counts as a transient death towards
+  `RALPH_TRANSIENT_PARK_CAP`.
 
 Parking = `needs-human` label + a comment saying exactly what to decide, and
 the issue back in Ready so you see it. The loop never picks up an issue that
@@ -312,6 +322,10 @@ written for a human. Set `RALPH_WORKER_SYS=""` for ordinary output.
 │              -pipelinefix-N.log, -resync-N.log, -rebase-resolve.log
 └── <owner>__<repo>--<n>/   the per-issue clone
 ```
+
+Stopping the loop (Ctrl-C, SIGTERM, or the `MAX_RUNTIME` limit) ends the
+live agent sessions and releases every ticket still claimed, so the project
+is left as the loop found it and the next run starts clean.
 
 State outlives runs and is shared by every project ever looped on the
 machine; each entry records the project that launched it and every

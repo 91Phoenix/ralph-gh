@@ -1086,3 +1086,102 @@ class TestFreshness:
         assert "conflicts with `main`" in comments(tracker)
         assert tracker.labels == [KEY]
         assert state.state_of(KEY) == "pr_open"
+
+
+# ---------------------------------------------------------------------------
+# Interrupted pipelines: a pipeline that dies with the loop (Ctrl-C, crash,
+# watchdog) must not leave its ticket In Progress and assigned, which the
+# frontier reads as "somebody is on it" for ever (built-by-raffa#41-#44: four
+# pipelines died with the orchestrator; the next run idled on all four).
+# ---------------------------------------------------------------------------
+class TestReleaseClaim:
+    def _running(self, state, key=KEY, pid="999", pr=""):
+        state.set(key, "state", "running")
+        state.set(key, "pid", pid)
+        state.set(key, "branch", BRANCH)
+        state.set(key, "base", "base-sha")
+        state.mark_project(key)
+        if pr:
+            state.set(key, "pr", pr)
+
+    def test_orphan_without_pr_is_requeued(self, env):
+        orch, tracker, _, ops, state, _ = env
+        self._running(state)
+        assert orch.reclaim_orphans(lambda p: False) == [KEY]
+        assert state.state_of(KEY) == "requeued"
+        assert state.get(KEY, "pid") == ""
+        assert tracker.requeues == [(KEY, orch.cfg.st_ready)]
+        assert "interrupted" in comments(tracker)
+        assert "no human action needed" in comments(tracker)
+        assert ops.pushes == 0 and tracker.labels == []
+
+    def test_live_pipeline_is_left_alone(self, env):
+        orch, tracker, _, _, state, _ = env
+        self._running(state)
+        assert orch.reclaim_orphans(lambda p: p == "999") == []
+        assert state.state_of(KEY) == "running" and tracker.requeues == []
+
+    def test_only_running_states_are_candidates(self, env):
+        orch, tracker, _, _, state, _ = env
+        for k, st in (("o/r#2", "pr_open"), ("o/r#3", "failed"),
+                      ("o/r#4", "requeued"), ("o/r#5", "done")):
+            state.set(k, "state", st); state.set(k, "pid", "1"); state.mark_project(k)
+        assert orch.reclaim_orphans(lambda p: False) == []
+        assert tracker.requeues == [] and tracker.comments == []
+
+    def test_foreign_project_entries_are_not_touched(self, env):
+        orch, tracker, _, _, state, _ = env
+        state.set(KEY, "state", "running"); state.set(KEY, "pid", "1")
+        state.set(KEY, "project", "someone/else")
+        assert orch.reclaim_orphans(lambda p: False) == []
+        assert tracker.requeues == []
+
+    def test_orphan_with_pr_resumes_tracking(self, env):
+        orch, tracker, _, _, state, _ = env
+        self._running(state, pr="7")
+        orch.reclaim_orphans(lambda p: False)
+        assert state.state_of(KEY) == "pr_open"
+        assert tracker.requeues == [] and tracker.statuses == []
+        assert "PR #7" in comments(tracker)
+
+    def test_committed_work_is_pushed_before_requeue(self, env):
+        orch, tracker, _, ops, state, _ = env
+        self._running(state)
+        ops.committed_work = True
+        orch.reclaim_orphans(lambda p: False)
+        assert ops.pushes == 1
+        assert state.state_of(KEY) == "requeued"
+        assert "pushed to `feature/issue-1`" in comments(tracker)
+
+    def test_failed_push_of_committed_work_is_said(self, env):
+        orch, tracker, _, ops, state, _ = env
+        self._running(state)
+        ops.committed_work = True
+        ops.push_results = [False]
+        orch.reclaim_orphans(lambda p: False)
+        assert state.state_of(KEY) == "requeued"
+        assert "push failed" in comments(tracker)
+
+    def test_no_workspace_means_no_push(self, env):
+        orch, _, _, ops, state, _ = env
+        self._running(state)
+        ops.committed_work = True
+        ops.exists = False
+        orch.reclaim_orphans(lambda p: False)
+        assert ops.pushes == 0 and state.state_of(KEY) == "requeued"
+
+    def test_repeated_interruptions_park_at_the_cap(self, env):
+        orch, tracker, _, _, state, _ = env
+        self._running(state)
+        state.set(KEY, "transient_deaths", orch.cfg.transient_park_cap - 1)
+        orch.release_claim(KEY, "the loop was stopped")
+        assert state.state_of(KEY) == "failed"
+        assert tracker.labels == [KEY]
+        assert "needs a human" in comments(tracker)
+
+    def test_released_ticket_is_launchable_again(self, env):
+        orch, _, _, _, state, _ = env
+        self._running(state)
+        orch.reclaim_orphans(lambda p: False)
+        plan = orch.launch_plan({"children": [{"key": KEY, "ready": True}]}, 1)
+        assert [c["key"] for c in plan] == [KEY]

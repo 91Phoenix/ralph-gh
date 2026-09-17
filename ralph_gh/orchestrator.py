@@ -287,6 +287,66 @@ class Orchestrator:
         self._park(key, park_msg)
 
     # -----------------------------------------------------------------------
+    # Interrupted pipelines
+    # -----------------------------------------------------------------------
+    def release_claim(self, key: str, why: str) -> None:
+        """Hand an interrupted pipeline's ticket back to the loop. A pipeline
+        that dies with the orchestrator (Ctrl-C, crash, reboot, the
+        watchdog) leaves the issue In Progress and assigned, which the
+        frontier reads as "somebody is on it" for ever: the next run idles
+        on the ticket and a human has to reset it by hand.
+
+        With a PR already open the poller's merge detection and resync take
+        over, so only the state moves to pr_open. Without one the ticket goes
+        back to Ready, unassigned, and the next pipeline cuts the branch
+        afresh; committed but unpushed work is pushed first so nothing is
+        lost. Interruptions count as transient deaths: past
+        RALPH_TRANSIENT_PARK_CAP the ticket is parked instead of cycling."""
+        self.state.set(key, "pid", "")
+        pr = self.state.get(key, "pr")
+        if pr:
+            self.state.set(key, "state", "pr_open")
+            self.tracker.comment(
+                key, f"{TAG}: {why} after PR #{pr} was opened; the loop keeps "
+                     f"tracking the PR.")
+            self.log(f"{key}: {why} — PR #{pr} is open, tracking resumes")
+            return
+        kept = ""
+        branch, base = self.state.get(key, "branch"), self.state.get(key, "base")
+        if branch and base and self.ops.workspace_exists(key):
+            ws = self.ops.workspace(key)
+            if self.ops.has_new_commits(ws, branch, base):
+                if self.ops.push(key, branch):
+                    kept = (f" Commits from the interrupted run were pushed to "
+                            f"`{branch}` for reference; the next run starts the "
+                            f"branch afresh.")
+                else:
+                    kept = (f" Committed but unpushed work exists in {ws} and "
+                            f"the push failed; look before it is discarded.")
+        self._transient_requeue(
+            key, True,
+            f"{TAG}: {why} before a PR was opened ({{n}}/{{cap}}) — back to "
+            f"Ready for automatic pickup, no human action needed.{kept}",
+            f"{TAG}: {why} before a PR was opened, for the "
+            f"{self.cfg.transient_park_cap}th time; needs a human.{kept}")
+        self.log(f"{key}: {why} — {self.state.state_of(key)}")
+
+    def reclaim_orphans(self, pid_alive: Callable[[str], bool]) -> List[str]:
+        """Tickets this project claimed whose pipeline process is gone
+        without a verdict: a previous run was interrupted. Released so the
+        frontier can pick them up again on this very poll."""
+        out = []
+        for key in self.state.owned_keys():
+            if self.state.state_of(key) != "running":
+                continue
+            pid = self.state.get(key, "pid")
+            if pid and pid_alive(pid):
+                continue
+            self.release_claim(key, "the pipeline was interrupted")
+            out.append(key)
+        return out
+
+    # -----------------------------------------------------------------------
     # The full per-ticket pipeline
     # -----------------------------------------------------------------------
     def run_pipeline(self, key: str, summary: str, repoval: str,
