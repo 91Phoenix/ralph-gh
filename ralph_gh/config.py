@@ -85,6 +85,16 @@ def _agent(val: str) -> str:
 
 BROWSERS = ("playwright", "none")
 
+MERGE_METHODS = ("squash", "merge", "rebase")
+
+
+def _merge_method(val: str) -> str:
+    val = (val or "squash").strip().lower()
+    if val not in MERGE_METHODS:
+        raise ValueError(f"RALPH_MERGE_METHOD must be one of "
+                         f"{', '.join(MERGE_METHODS)}, got {val!r}")
+    return val
+
 
 def _browser(val: str) -> str:
     val = (val or "playwright").strip().lower()
@@ -139,6 +149,12 @@ class Config:
     resync_grace: int
     rebase_resolve: bool
     draft_prs: bool
+
+    # Auto-merge — opt-in. When on, a PR whose review comments were all
+    # addressed and whose checks are green at the hand-off is merged by the
+    # loop instead of being left for a human. Off, the PR is handed over.
+    auto_merge: bool
+    merge_method: str           # "squash" | "merge" | "rebase"
 
     # Collaudo — optional local acceptance run of each PR (review -> collaudo
     # -> address). Off by default: it needs the app running locally.
@@ -222,6 +238,8 @@ class Config:
             resync_grace=_int(env, "RALPH_RESYNC_GRACE", 600),
             rebase_resolve=env.get("RALPH_REBASE_RESOLVE", "1") == "1",
             draft_prs=env.get("RALPH_DRAFT_PRS", "1") == "1",
+            auto_merge=env.get("RALPH_AUTO_MERGE", "0") == "1",
+            merge_method=_merge_method(env.get("RALPH_MERGE_METHOD", "squash")),
             collaudo=env.get("RALPH_COLLAUDO", "0") == "1",
             collaudo_repos=env.get("RALPH_COLLAUDO_REPOS", ""),
             collaudo_probe=env.get("RALPH_COLLAUDO_PROBE", ""),

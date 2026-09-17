@@ -33,6 +33,7 @@ class TestConfig:
         assert c.target_branch == ""
         assert c.max_concurrent == 2
         assert c.draft_prs is True
+        assert c.auto_merge is False and c.merge_method == "squash"
         assert c.state_dir.endswith("/.state")
         assert c.skill_implement == "tdd"
 
@@ -51,6 +52,13 @@ class TestConfig:
         assert c.workspace_base == "/tmp/w"
         assert c.st_ready == "Backlog"
         assert c.model == "opus"
+
+    def test_auto_merge_opt_in(self):
+        c = Config.from_env("o/1", env={"RALPH_AUTO_MERGE": "1",
+                                         "RALPH_MERGE_METHOD": "Rebase"})
+        assert c.auto_merge is True and c.merge_method == "rebase"
+        with pytest.raises(ValueError):
+            Config.from_env("o/1", env={"RALPH_MERGE_METHOD": "fast-forward"})
 
     def test_agent_selection(self):
         assert Config.from_env("o/1", env={}).agent == "claude"

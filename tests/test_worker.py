@@ -223,6 +223,7 @@ class TestPrompts:
         p = worker.address_prompt(CFG, self.K, self.N, "3", self.F, self.B)
         assert worker.PR_COMMENTS in p and "/replies" in p
         assert "fix(#7): address review" in p and "do NOT create BUILD_OK" in p
+        assert "reply in its thread" in p
 
     def test_resync_closes_only_gap(self):
         p = worker.resync_prompt(CFG, self.K, self.N, "3", self.F, self.B, "the issue was edited")

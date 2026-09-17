@@ -11,6 +11,8 @@ where the previous run left off. Files (KEY is the ticket key
     <STATE_DIR>/<KEY>.started   epoch
     <STATE_DIR>/<KEY>.project   project that launched the work (ownership)
     <STATE_DIR>/<KEY>.resync_at / .resync_count / .transient_deaths
+    <STATE_DIR>/<KEY>.rebase_pending  "1" after an auto-merge until the poller
+                                      has rebased the sibling PRs
 """
 
 import os

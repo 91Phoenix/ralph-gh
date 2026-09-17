@@ -166,6 +166,17 @@ mutation($project: ID!, $item: ID!, $field: ID!, $option: String!) {
   }) { projectV2Item { id } }
 }"""
 
+_THREADS_Q = """
+query($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      reviewThreads(first: 100) {
+        nodes { isResolved isOutdated comments(first: 1) { totalCount } }
+      }
+    }
+  }
+}"""
+
 _READY_M = """
 mutation($id: ID!) {
   markPullRequestReadyForReview(input: { pullRequestId: $id }) {
@@ -369,7 +380,10 @@ class GitHubClient:
         return str(d["number"]), d.get("html_url", "")
 
     def pr_info(self, full: str, number: str) -> dict:
-        """{state, number, url, head_sha, node_id, draft} or {} when unreadable."""
+        """{state, number, url, head_sha, node_id, draft, mergeable,
+        mergeable_state} or {} when unreadable. `mergeable` is None and
+        `mergeable_state` is "unknown" while GitHub is still computing them
+        after a push."""
         try:
             d = self.gh.api(f"repos/{full}/pulls/{number}")
         except GhError:
@@ -379,7 +393,9 @@ class GitHubClient:
         return {"state": _pr_state(d), "number": str(d.get("number", number)),
                 "url": d.get("html_url", ""),
                 "head_sha": (d.get("head") or {}).get("sha", ""),
-                "node_id": d.get("node_id", ""), "draft": bool(d.get("draft"))}
+                "node_id": d.get("node_id", ""), "draft": bool(d.get("draft")),
+                "mergeable": d.get("mergeable"),
+                "mergeable_state": d.get("mergeable_state") or "unknown"}
 
     def mark_ready(self, node_id: str) -> bool:
         try:
@@ -387,6 +403,38 @@ class GitHubClient:
             return True
         except GhError:
             return False
+
+    def unanswered_review_threads(self, full: str, number: str) -> int:
+        """Inline review threads nobody answered: not resolved, not outdated
+        by a later commit, and holding only the reviewer's own comment.
+        -1 when it cannot be determined (never mistaken for zero)."""
+        owner, name = full.split("/", 1)
+        try:
+            data = self.gh.graphql(_THREADS_Q, {"owner": owner, "name": name,
+                                                "number": int(number)})
+        except (GhError, ValueError):
+            return -1
+        pr = ((data.get("repository") or {}).get("pullRequest") or {})
+        nodes = ((pr.get("reviewThreads") or {}).get("nodes")) or []
+        return sum(1 for t in nodes
+                   if not t.get("isResolved") and not t.get("isOutdated")
+                   and int(((t.get("comments") or {}).get("totalCount")) or 0) < 2)
+
+    def merge_pr(self, full: str, number: str, method: str = "squash"
+                 ) -> Tuple[bool, str]:
+        """Merge the PR with `method` ("squash" | "merge" | "rebase").
+        Returns (True, merge sha) or (False, GitHub's reason) — a 405 says
+        the PR is not mergeable (branch protection, conflicts, red required
+        checks), a 409 that the head moved under us."""
+        try:
+            d = self.gh.api(f"repos/{full}/pulls/{number}/merge", "PUT",
+                            body={"merge_method": method})
+        except GhError as e:
+            return False, str(e)
+        if isinstance(d, dict) and d.get("merged"):
+            return True, d.get("sha", "")
+        return False, (d or {}).get("message", "not merged") \
+            if isinstance(d, dict) else "not merged"
 
     def pr_comment_count(self, full: str, number: str) -> int:
         """Review comments + conversation comments + non-empty review bodies.

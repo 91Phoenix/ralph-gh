@@ -174,6 +174,54 @@ class TestPullRequests:
         info = c.pr_info("o/r", "3")
         assert info["state"] == "OPEN" and info["draft"] and info["head_sha"] == "abc"
 
+    def test_pr_info_mergeability(self):
+        c, _ = client_for(route([("pulls/3", {"number": 3, "state": "open",
+                                              "mergeable": True,
+                                              "mergeable_state": "clean"})]))
+        info = c.pr_info("o/r", "3")
+        assert info["mergeable"] is True and info["mergeable_state"] == "clean"
+
+    def test_pr_info_mergeability_unknown_while_computing(self):
+        c, _ = client_for(route([("pulls/3", {"number": 3, "state": "open",
+                                              "mergeable": None})]))
+        assert c.pr_info("o/r", "3")["mergeable_state"] == "unknown"
+
+    def test_merge_pr_squash(self):
+        c, run = client_for(route([("pulls/3/merge", {"merged": True, "sha": "m1"})]))
+        assert c.merge_pr("o/r", "3", "squash") == (True, "m1")
+        argv, stdin = run.calls[0]
+        assert "PUT" in argv and "repos/o/r/pulls/3/merge" in argv
+        assert json.loads(stdin) == {"merge_method": "squash"}
+
+    def test_merge_pr_refused_carries_reason(self):
+        c, _ = client_for(lambda a, s: (1, "", "gh: Pull Request is not mergeable (HTTP 405)"))
+        ok, why = c.merge_pr("o/r", "3")
+        assert ok is False and "HTTP 405" in why
+
+    def test_merge_pr_not_merged_flag(self):
+        c, _ = client_for(route([("pulls/3/merge", {"merged": False, "message": "nope"})]))
+        assert c.merge_pr("o/r", "3") == (False, "nope")
+
+    def _threads(self, nodes):
+        payload = {"data": {"repository": {"pullRequest": {
+            "reviewThreads": {"nodes": nodes}}}}}
+        return client_for(lambda a, s: (0, json.dumps(payload), ""))[0]
+
+    def test_unanswered_threads_counts_lone_open_comments(self):
+        c = self._threads([
+            {"isResolved": False, "isOutdated": False, "comments": {"totalCount": 1}},
+            {"isResolved": False, "isOutdated": False, "comments": {"totalCount": 2}},
+            {"isResolved": True, "isOutdated": False, "comments": {"totalCount": 1}},
+            {"isResolved": False, "isOutdated": True, "comments": {"totalCount": 1}}])
+        assert c.unanswered_review_threads("o/r", "3") == 1
+
+    def test_unanswered_threads_none_is_zero(self):
+        assert self._threads([]).unanswered_review_threads("o/r", "3") == 0
+
+    def test_unanswered_threads_unknown_is_minus_one(self):
+        c, _ = client_for(lambda a, s: (1, "", "gh: boom (HTTP 500)"))
+        assert c.unanswered_review_threads("o/r", "3") == -1
+
     def test_comment_count_sums_three_sources(self):
         c, _ = client_for(route([
             ("pulls/3/comments", [{"id": 1}, {"id": 2}]),
