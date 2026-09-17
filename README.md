@@ -8,8 +8,10 @@ Code session that implements the issue test-first, pushes a branch, opens a
 draft pull request, waits for the GitHub checks (auto-fixing a red run up to
 twice), marks the PR ready, reviews it with a second session, addresses one
 round of review comments with a third, and leaves the PR open for **you** to
-merge. When a PR merges the issue moves to Done — which unblocks the issues
-that depended on it — and the loop keeps going.
+merge — or, with `RALPH_AUTO_MERGE=1`, merges it itself once every review
+thread was answered and the checks are green. When a PR merges the issue
+moves to Done — which unblocks the issues that depended on it — and the loop
+keeps going.
 
 It is a single-user tool. Everything goes through the `gh` CLI you are
 already logged into: no MCP servers, no tokens of its own, no service
@@ -148,8 +150,18 @@ review comments the address session reads), `BUILD_OK` / `BUILD_FAIL`.
 7. **Address.** One session works through every comment — review findings
    and `collaudo:` findings alike: fix it (with a test) or reply why not;
    code changes are pushed and re-verified.
-8. **Done for the agent.** Comment "ready for a human to merge". The PR is
-   yours.
+8. **Hand-off, or auto-merge.** By default: comment "ready for a human to
+   merge" and the PR is yours. With `RALPH_AUTO_MERGE=1` the loop merges the
+   PR itself (`RALPH_MERGE_METHOD`, squash by default) when **all** of these
+   hold at this moment: the address pass completed, no inline review thread
+   is left without a fix or a reply (the address worker replies in the
+   thread when it fixes something), the checks on the head being merged are
+   green, and GitHub itself calls the PR `clean` (so branch protection, a
+   required human review or a conflict still block it). Any doubt — or a
+   merge the API refuses — is reported on the issue and the PR is handed to
+   you as before. An auto-merge closes the issue at once; the sibling
+   rebase happens on the next poll, like a manual merge. Never enable it on
+   a repo where you want to read every diff before it lands.
 
 A branch is kept **fresh** at two points: right after the implement session,
 before anything is pushed or a PR exists, and right before the hand-off
@@ -275,6 +287,8 @@ Everything is an environment variable.
 | `RALPH_RESYNC` / `RALPH_RESYNC_CAP` / `RALPH_RESYNC_GRACE` | `1` / `2` / `600` | catch-up passes on edited issues |
 | `RALPH_REBASE_RESOLVE` | `1` | let Claude resolve sibling-rebase conflicts |
 | `RALPH_DRAFT_PRS` | `1` | open PRs as drafts until checks are green |
+| `RALPH_AUTO_MERGE` | `0` | `1` merges a PR itself once the review threads are all answered and the checks are green; off, the PR is handed to a human |
+| `RALPH_MERGE_METHOD` | `squash` | `squash`, `merge` or `rebase` for the auto-merge |
 | `RALPH_AGENT` | `claude` | `claude` or `opencode` — which CLI runs worker sessions |
 | `RALPH_AGENT_BIN` | *(= `RALPH_AGENT`)* | executable override, e.g. `kilo` with `RALPH_AGENT=opencode` |
 | `RALPH_MODEL` | *(CLI default)* | `--model` for worker sessions (`provider/model` on OpenCode) |

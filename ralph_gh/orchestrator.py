@@ -4,7 +4,8 @@ Per ticket (fresh Claude session each phase):
 implement (test-first) -> push -> branch-base guard -> open a draft PR ->
 verify GitHub checks (auto-fix capped) -> mark ready for review -> review
 (comments on the PR) -> address comments (one round) -> leave the PR open
-for a human merge. Merged PRs close their issue, unblock dependants and
+for a human merge, or — with RALPH_AUTO_MERGE=1 — merge it when every review
+thread was answered and the checks are green. Merged PRs close their issue, unblock dependants and
 rebase the loop's other open PRs on the same repo. Open PRs whose issue was
 edited after the branch's last commit get a capped catch-up pass (resync).
 
@@ -529,6 +530,7 @@ class Orchestrator:
         self.run_collaudo(key, number, pr, full, ws, branch)
 
         # ---- Phase 3: address ----
+        green = True   # checks on the head that will be handed over / merged
         worker.clear_markers(ws)
         worker.write_pr_comments(ws, self.gh.pr_comments_md(full, pr))
         address_log = self._log_path(key, "address")
@@ -539,6 +541,7 @@ class Orchestrator:
             address_log)
         if worker.build_ok(ws):
             res = self.push_and_verify(key, full, branch, pr)
+            green = res == OK
             self.log(f"{key}: address pass pushed ({res})")
             if res == PIPELINE_FAILED:
                 self.tracker.comment(
@@ -584,6 +587,7 @@ class Orchestrator:
             self.log(f"{key}: rebased {branch} onto {target} before the "
                      f"hand-off ({fresh}) — verifying checks again")
             res = self.verify_checks(key, full, branch, pr)
+            green = res == OK
             if res != OK:
                 self.tracker.comment(
                     key, f"{TAG}: PR #{pr} was rebased onto `{target}` but the "
@@ -594,10 +598,81 @@ class Orchestrator:
                     key, f"{TAG}: rebased `{branch}` onto `{target}` after a "
                          f"sibling merged; merge conflicts were resolved "
                          f"automatically. Please sanity-check the PR diff.")
+        if cfg.auto_merge:
+            if not green:
+                self.tracker.comment(
+                    key, f"{TAG}: auto-merge skipped — the checks on PR #{pr} "
+                         f"are not green. Ready for a human to look at.")
+            elif self.try_auto_merge(key, full, pr):
+                return
+            self.state.set(key, "state", "pr_open")
+            self.log(f"{key}: pipeline complete — PR #{pr} awaits a human merge")
+            return
         self.tracker.comment(key, f"{TAG}: review + fixes done; PR #{pr} is "
                                   f"ready for a human to merge.")
         self.state.set(key, "state", "pr_open")
         self.log(f"{key}: pipeline complete — PR #{pr} awaits a human merge")
+
+    # -----------------------------------------------------------------------
+    # Auto-merge
+    # -----------------------------------------------------------------------
+    MERGEABLE_STATES = ("clean", "has_hooks")
+    MERGEABILITY_POLLS = 10
+
+    def _merge_declined(self, key: str, pr: str, why: str) -> None:
+        self.warn(f"{key}: auto-merge declined — {why}")
+        self.tracker.comment(
+            key, f"{TAG}: auto-merge declined — {why}. PR #{pr} is left open; "
+                 f"ready for a human to merge.")
+
+    def try_auto_merge(self, key: str, full: str, pr: str) -> bool:
+        """Merge PR #pr now that the address pass ran and the checks are
+        green (the caller vouches for both). Every remaining doubt — a review
+        thread nobody answered, GitHub not calling the PR clean, the merge
+        API refusing — hands the PR to a human instead of forcing it. On
+        success the issue is closed here; the sibling rebase is left to the
+        poller (detect_merges) because this runs in a child process and no
+        two processes may touch one workspace."""
+        cfg = self.cfg
+        unanswered = self.gh.unanswered_review_threads(full, pr)
+        if unanswered < 0:
+            self._merge_declined(key, pr, "the review threads could not be read")
+            return False
+        if unanswered:
+            self._merge_declined(
+                key, pr, f"{unanswered} review thread(s) got neither a fix "
+                         f"nor a reply")
+            return False
+        info: dict = {}
+        for _ in range(self.MERGEABILITY_POLLS):
+            info = self.gh.pr_info(full, pr)
+            if not info or info.get("mergeable_state") != "unknown":
+                break
+            self.sleep(cfg.checks_poll_wait)   # GitHub computes it after a push
+        if not info or info.get("state") != "OPEN":
+            self._merge_declined(key, pr, "the PR is not open any more")
+            return False
+        if info.get("draft"):
+            self._merge_declined(key, pr, "the PR is still a draft")
+            return False
+        mstate = info.get("mergeable_state", "unknown")
+        if mstate not in self.MERGEABLE_STATES:
+            self._merge_declined(
+                key, pr, f"GitHub reports the PR as `{mstate}`, not `clean` "
+                         f"(branch protection, a conflict or a required "
+                         f"review can cause this)")
+            return False
+        ok, detail = self.gh.merge_pr(full, pr, cfg.merge_method)
+        if not ok:
+            self._merge_declined(key, pr, f"GitHub refused the merge: {detail}")
+            return False
+        self.log(f"{key}: PR #{pr} auto-merged ({cfg.merge_method})")
+        self.state.set(key, "rebase_pending", "1")
+        self._close_merged(
+            key, pr, f"{TAG}: review comments addressed and checks green — "
+                     f"PR #{pr} merged automatically ({cfg.merge_method}). "
+                     f"Closing.")
+        return True
 
     def run_collaudo(self, key: str, number: int, pr: str, full: str,
                      ws: str, branch: str) -> None:
@@ -671,17 +746,24 @@ class Orchestrator:
         self.warn(f"{key}: no open or merged PR found for {branch} in {full}")
         return False
 
-    def _close_merged(self, key: str, pr: str) -> None:
+    def _close_merged(self, key: str, pr: str, msg: str = "") -> None:
         self.state.set(key, "state", "done")
         self.state.set(key, "pr", pr)
         self.tracker.close_done(key, self.cfg.st_done,
-                                f"{TAG}: PR #{pr} merged. Closing.")
+                                msg or f"{TAG}: PR #{pr} merged. Closing.")
         self.log(f"{key}: PR #{pr} merged — done")
 
     def detect_merges(self) -> None:
         merged_pairs = []
         for key in self.state.owned_keys():
-            if self.state.state_of(key) != "pr_open":
+            st = self.state.state_of(key)
+            if st == "done" and self.state.get(key, "rebase_pending"):
+                # auto-merged by a child pipeline; it left the sibling
+                # rebase to us so only the poller touches idle workspaces
+                self.state.set(key, "rebase_pending", "")
+                merged_pairs.append((key, self.state.get(key, "repo")))
+                continue
+            if st != "pr_open":
                 continue
             full = self.state.get(key, "repo")
             branch = self.state.get(key, "branch")

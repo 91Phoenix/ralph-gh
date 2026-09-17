@@ -95,6 +95,9 @@ class FakeGh:
         self.infos = {}             # pr -> dict
         self.ready = []
         self.comments_md = "# comments\n"
+        self.unanswered = 0
+        self.merge_result = (True, "msha")
+        self.merged = []            # (full, number, method)
 
     def repo_reachable(self, full):
         return self.reachable
@@ -128,6 +131,13 @@ class FakeGh:
 
     def checks_status(self, full, sha):
         return self.checks.pop(0) if self.checks else "NONE"
+
+    def unanswered_review_threads(self, full, number):
+        return self.unanswered
+
+    def merge_pr(self, full, number, method="squash"):
+        self.merged.append((full, number, method))
+        return self.merge_result
 
 
 class FakeOps:
@@ -271,10 +281,11 @@ def seq(*fns):
 
 
 @pytest.fixture()
-def env(tmp_path):
+def env(tmp_path, request):
+    extra = getattr(request, "param", {}) or {}
     cfg = Config.from_env("o/1", env={"RALPH_WORKSPACES": str(tmp_path / "w"),
                                        "CHECKS_POLL_WAIT": "0",
-                                       "POLL_SECONDS": "0"})
+                                       "POLL_SECONDS": "0", **extra})
     os.makedirs(cfg.state_dir, exist_ok=True)
     tracker, gh, runner = FakeTracker(), FakeGh(), FakeRunner()
     ops = FakeOps(str(tmp_path / "w"))
@@ -647,6 +658,161 @@ class TestCollaudo:
 # ---------------------------------------------------------------------------
 # PR state truth, merges, sibling rebases
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Auto-merge (RALPH_AUTO_MERGE=1)
+# ---------------------------------------------------------------------------
+AUTO = {"RALPH_AUTO_MERGE": "1"}
+CLEAN = {"state": "OPEN", "draft": False, "node_id": "N7",
+         "mergeable": True, "mergeable_state": "clean"}
+
+
+def merged_prs(gh):
+    return [(n, m) for _, n, m in gh.merged]
+
+
+@pytest.mark.parametrize("env", [AUTO], indirect=True)
+class TestAutoMerge:
+    def test_merges_and_closes_when_addressed_and_green(self, env):
+        orch, tracker, gh, _, state, _ = env
+        gh.infos["7"] = CLEAN
+        run(orch)
+        assert merged_prs(gh) == [("7", "squash")]
+        assert state.state_of(KEY) == "done" and state.get(KEY, "rebase_pending") == "1"
+        assert tracker.closed == [(KEY, "Done")]
+        assert "merged automatically" in comments(tracker)
+        assert "ready for a human to merge" not in comments(tracker)
+        assert tracker.labels == []
+
+    def test_draft_is_marked_ready_first_then_merged(self, env):
+        orch, _, gh, _, state, _ = env
+        # pr_info is read for the draft check (draft) and again for the
+        # mergeability check (clean): the same PR at two moments
+        gh.infos["7"] = {"draft": True, "node_id": "N7"}
+        seen = {"n": 0}
+        real = gh.pr_info
+
+        def two_phase(full, number):
+            seen["n"] += 1
+            return real(full, number) if seen["n"] == 1 else CLEAN
+        gh.pr_info = two_phase
+        run(orch)
+        assert gh.ready == ["N7"] and merged_prs(gh) == [("7", "squash")]
+        assert state.state_of(KEY) == "done"
+
+    def test_unanswered_thread_hands_over(self, env):
+        orch, tracker, gh, _, state, _ = env
+        gh.infos["7"] = CLEAN
+        gh.unanswered = 2
+        run(orch)
+        assert gh.merged == [] and state.state_of(KEY) == "pr_open"
+        assert "2 review thread(s)" in comments(tracker)
+        assert "ready for a human to merge" in comments(tracker)
+
+    def test_unreadable_threads_hand_over(self, env):
+        orch, tracker, gh, _, state, _ = env
+        gh.infos["7"] = CLEAN
+        gh.unanswered = -1
+        run(orch)
+        assert gh.merged == [] and state.state_of(KEY) == "pr_open"
+        assert "could not be read" in comments(tracker)
+
+    def test_not_clean_hands_over(self, env):
+        orch, tracker, gh, _, state, _ = env
+        gh.infos["7"] = {**CLEAN, "mergeable_state": "blocked"}
+        run(orch)
+        assert gh.merged == [] and state.state_of(KEY) == "pr_open"
+        assert "`blocked`" in comments(tracker)
+
+    def test_unknown_mergeability_is_polled_then_merged(self, env):
+        orch, _, gh, _, state, _ = env
+        answers = [{**CLEAN, "mergeable_state": "unknown"}] * 2 + [CLEAN]
+        gh.pr_info = lambda full, number: answers.pop(0) if len(answers) > 1 else answers[0]
+        run(orch)
+        assert merged_prs(gh) == [("7", "squash")] and state.state_of(KEY) == "done"
+
+    def test_merge_api_refusal_hands_over(self, env):
+        orch, tracker, gh, _, state, _ = env
+        gh.infos["7"] = CLEAN
+        gh.merge_result = (False, "gh api PUT ...: Base branch was modified (HTTP 409)")
+        run(orch)
+        assert state.state_of(KEY) == "pr_open" and tracker.closed == []
+        assert "GitHub refused the merge" in comments(tracker) and "HTTP 409" in comments(tracker)
+
+    def test_red_checks_after_address_never_merge(self, env):
+        orch, tracker, gh, _, state, runner = env
+        gh.infos["7"] = CLEAN
+        runner.behavior["address"] = write_marker("BUILD_OK")
+        runner.behavior["pipeline-fix"] = write_marker("BUILD_FAIL", "still red")
+        gh.checks = ["SUCCESS"] + ["FAILED"] * 10
+        run(orch)
+        assert gh.merged == [] and state.state_of(KEY) == "pr_open"
+        assert "auto-merge skipped" in comments(tracker)
+
+    def test_red_checks_after_handoff_rebase_never_merge(self, env):
+        orch, _, gh, ops, state, _ = env
+        gh.infos["7"] = CLEAN
+        # implement-time freshness is clean; the hand-off rebase re-verifies
+        # and finds red
+        ops.behind = True
+        gh.checks = ["SUCCESS"] + ["FAILED"] * 10
+        run(orch)
+        assert gh.merged == [] and state.state_of(KEY) == "pr_open"
+
+    def test_unaddressed_review_never_merges(self, env):
+        orch, tracker, gh, _, state, runner = env
+        gh.infos["7"] = CLEAN
+        runner.behavior["address"] = no_marker("Could not resolve host")
+        run(orch)
+        assert gh.merged == [] and state.state_of(KEY) == "pr_open"
+        assert "UNADDRESSED" in comments(tracker)
+
+    def test_unreviewed_pr_never_merges(self, env):
+        orch, _, gh, _, state, _ = env
+        gh.infos["7"] = CLEAN
+        gh.comment_counts = [0]
+        run(orch)
+        assert gh.merged == [] and state.state_of(KEY) == "pr_open"
+
+def test_merge_method_from_env(tmp_path):
+    cfg = Config.from_env("o/1", env={"RALPH_WORKSPACES": str(tmp_path / "w"),
+                                       "CHECKS_POLL_WAIT": "0",
+                                       "RALPH_AUTO_MERGE": "1",
+                                       "RALPH_MERGE_METHOD": "rebase"})
+    os.makedirs(cfg.state_dir, exist_ok=True)
+    tracker, gh, runner = FakeTracker(), FakeGh(), FakeRunner()
+    ops = FakeOps(str(tmp_path / "w"))
+    state = StateStore(cfg.state_dir, cfg.project_ref)
+    orch = Orchestrator(cfg, tracker, gh, ops, state, runner,
+                        log=lambda m: None, sleep=lambda s: None,
+                        now=lambda: 5000.0)
+    runner.behavior["implement"] = write_impl_output()
+    gh.infos["7"] = CLEAN
+    run(orch)
+    assert merged_prs(gh) == [("7", "rebase")]
+
+
+class TestAutoMergeOffByDefault:
+    def test_default_hands_over_even_when_clean(self, env):
+        orch, tracker, gh, _, state, _ = env
+        gh.infos["7"] = CLEAN
+        run(orch)
+        assert gh.merged == [] and state.state_of(KEY) == "pr_open"
+        assert "ready for a human to merge" in comments(tracker)
+
+    def test_poller_rebases_siblings_of_an_auto_merged_pr(self, env):
+        orch, _, gh, ops, state, _ = env
+        state.set(KEY, "state", "done"); state.set(KEY, "repo", FULL)
+        state.set(KEY, "branch", BRANCH); state.set(KEY, "pr", "7")
+        state.set(KEY, "rebase_pending", "1"); state.mark_project(KEY)
+        pr_open_state(state, "o/r#2", pr="8")
+        gh.prs[("feature/issue-2", "OPEN")] = ("OPEN", "8", "u")
+        orch.detect_merges()
+        assert ("rebase", "main") in ops.events and ("force_push", "feature/issue-2") in ops.events
+        assert state.get(KEY, "rebase_pending") == ""
+        orch.detect_merges()   # idempotent: the flag is consumed
+        assert ops.events.count(("rebase", "main")) == 1
+
+
 def pr_open_state(state, key, full=FULL, branch=None, target="main", pr="7"):
     state.set(key, "state", "pr_open")
     state.set(key, "repo", full)
