@@ -216,21 +216,44 @@ def keep_failed_log(logf: str, attempt: int) -> str:
 # ---------------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------------
+# The agent session this process is running right now. It lives in its own
+# session (start_new_session), so a signal that stops the pipeline does not
+# reach it by itself; the pipeline's handler ends it through here.
+_current_proc: Optional["subprocess.Popen"] = None
+
+
+def _terminate(proc: "subprocess.Popen") -> None:
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+    except OSError:
+        proc.terminate()
+
+
+def terminate_current_worker() -> None:
+    """Stop the running agent session, if any. Called from the pipeline's
+    signal handler: a pipeline killed without this leaves a headless agent
+    session editing and committing in the workspace with nobody watching."""
+    proc = _current_proc
+    if proc is not None and proc.poll() is None:
+        _terminate(proc)
+
+
 def _exec(cmd: List[str], cwd: str, logf: str, timeout: int,
           env: Optional[dict] = None) -> int:
+    global _current_proc
     with open(logf, "w") as log:
         proc = subprocess.Popen(cmd, cwd=cwd, stdout=log,
                                 stderr=subprocess.STDOUT, env=env,
                                 start_new_session=True)
+        _current_proc = proc
         try:
             return proc.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
-            try:
-                os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-            except OSError:
-                proc.terminate()
+            _terminate(proc)
             proc.wait()
             return 124
+        finally:
+            _current_proc = None
 
 
 def playwright_mcp_server(ws: str) -> dict:
