@@ -27,6 +27,10 @@ from .text import branch_for, parse_repo, split_key
 OK = "ok"
 PUSH_FAILED = "push-failed"          # git/network problem — retryable
 PIPELINE_FAILED = "pipeline-failed"  # the code is red — a human's problem
+# bring_up_to_date(): the branch already sat on the target's tip, was rebased
+# cleanly, was rebased with conflicts Claude resolved, or could not be rebased
+# (the rebase was aborted and the branch left as it was).
+FRESH, REBASED, RESOLVED, CONFLICT = "fresh", "rebased", "resolved", "conflict"
 
 # states that must not be relaunched by the poller
 ACTIVE_OR_FINISHED = ("running", "resync", "pr_open", "done")
@@ -214,6 +218,37 @@ class Orchestrator:
                 return PUSH_FAILED
             self.log(f"{key}: re-pushed after fix {attempt}")
 
+    def bring_up_to_date(self, key: str, ws: str, branch: str, target: str) -> str:
+        """Rebase `branch` onto the target's tip when it has fallen behind.
+
+        A branch falls behind whenever a sibling merges while this one is
+        being implemented or reviewed, and a PR left that way shows as
+        CONFLICTING to the human it is handed to. Fetch first, so "behind" is
+        judged against the remote and not this workspace's memory of it. A
+        rebase that stops on conflicts gets one Claude session to finish it
+        (RALPH_REBASE_RESOLVE); if it still is not clean the rebase is aborted
+        and the branch left exactly as it was. Nothing is pushed here: the
+        caller knows whether the branch is on the remote yet.
+
+        Returns FRESH, REBASED, RESOLVED or CONFLICT."""
+        self.ops.fetch(ws)
+        if not self.ops.behind_target(ws, branch, target):
+            return FRESH
+        self.log(f"{key}: {branch} is behind {target} — rebasing")
+        if self.ops.rebase_onto(ws, target):
+            return REBASED
+        if self.cfg.rebase_resolve:
+            self.log(f"{key}: rebase conflicts — attempting Claude resolution")
+            self.runner.run(ws, f"rebase-resolve {key}",
+                            worker.rebase_resolve_prompt(branch, target),
+                            self._log_path(key, "rebase-resolve"))
+            if self.ops.rebase_finished_clean(ws) and \
+                    not self.ops.behind_target(ws, branch, target):
+                return RESOLVED
+            self.warn(f"{key}: Claude could not cleanly finish the rebase")
+        self.ops.abort_rebase(ws)
+        return CONFLICT
+
     def push_and_verify(self, key: str, full: str, branch: str, pr: str) -> str:
         """Local build gate + push + checks verify. Assumes the current
         worker already committed on `branch` and wrote BUILD_OK."""
@@ -355,6 +390,33 @@ class Orchestrator:
                 f" Log: {impl_log}")
             return
 
+        # ---- Freshness ----
+        # Siblings merge while a session runs; a branch cut before that merge
+        # would open a CONFLICTING PR. Rebase now, while nothing is pushed and
+        # no PR exists, and judge the base guard against the new base.
+        fresh = self.bring_up_to_date(key, ws, branch, target)
+        if fresh == CONFLICT:
+            if self.ops.push(key, branch):
+                self.log(f"{key}: pushed {branch} as it is, for a human")
+            self._park(key, f"{TAG}: the implementation on `{branch}` conflicts "
+                            f"with `{target}`, which moved on while it was being "
+                            f"written, and automatic resolution did not "
+                            f"succeed. The rebase was aborted and the branch is "
+                            f"pushed as it was; no PR was opened. Resolve "
+                            f"manually: `git rebase origin/{target}` on "
+                            f"`{branch}`, then re-push and open the PR. Needs a "
+                            f"human.")
+            return
+        if fresh != FRESH:
+            base = self.ops.remote_sha(ws, target) or base
+            self.log(f"{key}: rebased {branch} onto {target} before the PR ({fresh})")
+        if fresh == RESOLVED:
+            self.tracker.comment(
+                key, f"{TAG}: `{branch}` was rebased onto `{target}`, which "
+                     f"moved on while this issue was being implemented; merge "
+                     f"conflicts were resolved automatically. Please "
+                     f"sanity-check the PR diff.")
+
         # ---- Push ----
         if not self.ops.push(key, branch):
             self.warn(f"{key}: git push failed")
@@ -493,6 +555,45 @@ class Orchestrator:
             return
         else:
             self.log(f"{key}: address pass made no code change")
+
+        # ---- Freshness, again ----
+        # Review, collaudo and address take long enough for a sibling to
+        # merge in the meantime. A PR handed over as "ready" must be
+        # mergeable at that moment, not as of when it was opened.
+        fresh = self.bring_up_to_date(key, ws, branch, target)
+        if fresh == CONFLICT:
+            self.tracker.comment(
+                key, f"{TAG}: PR #{pr} conflicts with `{target}`, which moved "
+                     f"on while it was under review, and automatic resolution "
+                     f"did not succeed. The rebase was aborted (branch left "
+                     f"untouched). Resolve manually: `git rebase "
+                     f"origin/{target}` on `{branch}`, then re-push. Needs a "
+                     f"human.")
+            self.tracker.label_needs_human(key)
+            self.state.set(key, "state", "pr_open")
+            return
+        if fresh != FRESH:
+            if not self.ops.force_push(ws, branch):
+                self.tracker.comment(
+                    key, f"{TAG}: `{branch}` was rebased onto `{target}` but "
+                         f"the push failed; PR #{pr} is stale until a human "
+                         f"pushes the rebased branch from {ws}.")
+                self.tracker.label_needs_human(key)
+                self.state.set(key, "state", "pr_open")
+                return
+            self.log(f"{key}: rebased {branch} onto {target} before the "
+                     f"hand-off ({fresh}) — verifying checks again")
+            res = self.verify_checks(key, full, branch, pr)
+            if res != OK:
+                self.tracker.comment(
+                    key, f"{TAG}: PR #{pr} was rebased onto `{target}` but the "
+                         f"checks did not go green afterwards; a human should "
+                         f"look.")
+            if fresh == RESOLVED:
+                self.tracker.comment(
+                    key, f"{TAG}: rebased `{branch}` onto `{target}` after a "
+                         f"sibling merged; merge conflicts were resolved "
+                         f"automatically. Please sanity-check the PR diff.")
         self.tracker.comment(key, f"{TAG}: review + fixes done; PR #{pr} is "
                                   f"ready for a human to merge.")
         self.state.set(key, "state", "pr_open")
@@ -613,31 +714,20 @@ class Orchestrator:
             self.ops.fetch(ws)
             if not self.ops.checkout(ws, branch):
                 continue
-            if not self.ops.behind_target(ws, branch, target):
+            fresh = self.bring_up_to_date(key, ws, branch, target)
+            if fresh == FRESH:
                 continue
-            self.log(f"{key}: rebasing {branch} onto {target} after "
-                     f"{merged_key} merged")
-            if self.ops.rebase_onto(ws, target):
-                if self.ops.force_push(ws, branch):
-                    self.log(f"{key}: rebased + force-pushed")
-                else:
+            if fresh != CONFLICT:
+                if not self.ops.force_push(ws, branch):
                     self.warn(f"{key}: rebase clean but push failed")
-                continue
-            if self.cfg.rebase_resolve:
-                self.log(f"{key}: rebase conflicts — attempting Claude resolution")
-                self.runner.run(ws, f"rebase-resolve {key}",
-                                worker.rebase_resolve_prompt(branch, target),
-                                self._log_path(key, "rebase-resolve"))
-                if self.ops.rebase_finished_clean(ws) and \
-                        not self.ops.behind_target(ws, branch, target):
-                    self.ops.force_push(ws, branch)
+                    continue
+                self.log(f"{key}: rebased + force-pushed after {merged_key} merged")
+                if fresh == RESOLVED:
                     self.tracker.comment(
                         key, f"{TAG}: rebased `{branch}` onto `{target}` after "
                              f"{merged_key} merged; merge conflicts were resolved "
                              f"automatically. Please sanity-check the PR diff.")
-                    continue
-                self.warn(f"{key}: Claude could not cleanly finish the rebase")
-            self.ops.abort_rebase(ws)
+                continue
             self.tracker.comment(
                 key, f"{TAG}: this issue's PR conflicts with `{target}` after "
                      f"{merged_key} merged, and automatic resolution did not "

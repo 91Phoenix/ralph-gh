@@ -151,6 +151,16 @@ review comments the address session reads), `BUILD_OK` / `BUILD_FAIL`.
 8. **Done for the agent.** Comment "ready for a human to merge". The PR is
    yours.
 
+A branch is kept **fresh** at two points: right after the implement session,
+before anything is pushed or a PR exists, and right before the hand-off
+comment. If the target moved on in the meantime (a sibling merged), the
+branch is rebased onto it; a rebase that stops on conflicts gets one Claude
+session to finish it, and if that fails the rebase is aborted and the issue
+is parked `needs-human` with the branch untouched (pushed as it is when no PR
+exists yet, so nothing is lost). A rebase before the hand-off re-verifies
+the checks on the new head. The PR you are handed is mergeable at that
+moment, not as of when it was opened.
+
 Meanwhile, every poll (`POLL_SECONDS`, default 5 min):
 
 - **Merges close issues.** A merged PR moves its issue to Done and closes it,

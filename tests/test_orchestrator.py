@@ -148,6 +148,7 @@ class FakeOps:
         self.head_epoch = 1000
         self.committed_work = False
         self.exists = True
+        self.base_seen = []
 
     def detect_protocol(self, full):
         return self.proto
@@ -200,7 +201,11 @@ class FakeOps:
         return self.rebase_clean_after_worker
 
     def pr_base_ok(self, ws, branch, target, base):
+        self.base_seen.append(base)
         return self.base_ok
+
+    def remote_sha(self, ws, target):
+        return f"{target}-sha"
 
     def pr_retarget_candidate(self, ws, branch, current, base):
         return self.retarget
@@ -828,3 +833,90 @@ class TestLaunchPlan:
         data["children"][1]["ready"] = False
         assert [c["key"] for c in orch.launch_plan(data, 1)] == ["o/r#1"]
         assert [c["key"] for c in orch.launch_plan(data, 5)] == ["o/r#1", "o/r#3"]
+
+
+# ---------------------------------------------------------------------------
+# Freshness: a branch that fell behind its target is rebased before the PR
+# opens and again before the hand-off, not left for the human to discover
+# as a CONFLICTING PR (built-by-raffa#37: #20 merged while #21 was still
+# implementing; the sibling pass only looks at PRs that are already open).
+# ---------------------------------------------------------------------------
+class TestFreshness:
+    def test_stale_branch_is_rebased_before_the_pr_opens(self, env):
+        orch, tracker, gh, ops, state, runner = env
+        ops.behind = True
+        run(orch)
+        assert ops.events.index(("rebase", "main")) >= 0
+        assert len(gh.created) == 1
+        # The guard is asked about the new base, the target's tip, not the
+        # commit the branch was cut from before the rebase.
+        assert ops.base_seen[-1] == "main-sha"
+        assert "ready for a human to merge" in comments(tracker)
+        assert tracker.labels == []
+
+    def test_fresh_branch_is_not_touched(self, env):
+        orch, tracker, gh, ops, state, runner = env
+        ops.behind = False
+        run(orch)
+        assert ("rebase", "main") not in ops.events
+        assert ("force_push", BRANCH) not in ops.events
+        assert ops.base_seen[-1] == "base-sha"
+        assert "ready for a human to merge" in comments(tracker)
+
+    def test_conflict_before_the_pr_is_resolved_by_claude(self, env):
+        orch, tracker, gh, ops, state, runner = env
+        ops.rebase_ok = False
+        ops.rebase_clean_after_worker = True
+        ops.behind_target = lambda ws, b, t: f"rebase-resolve {KEY}" not in runner.sessions
+        run(orch)
+        assert runner.sessions[:2] == [f"implement {KEY}", f"rebase-resolve {KEY}"]
+        assert len(gh.created) == 1
+        assert "resolved automatically" in comments(tracker)
+        assert "ready for a human to merge" in comments(tracker)
+
+    def test_unresolvable_conflict_before_the_pr_parks_with_the_work_pushed(self, env):
+        orch, tracker, gh, ops, state, runner = env
+        ops.behind = True
+        ops.rebase_ok = False
+        ops.rebase_clean_after_worker = False
+        run(orch)
+        assert gh.created == []
+        assert ("abort", ops.workspace(KEY)) in ops.events
+        assert ops.pushes == 1, "the implementation is pushed so nothing is lost"
+        assert tracker.labels == [KEY]
+        assert "conflicts with `main`" in comments(tracker)
+        assert state.state_of(KEY) == "failed"
+
+    def test_branch_that_fell_behind_during_review_is_rebased_before_the_hand_off(self, env):
+        orch, tracker, gh, ops, state, runner = env
+        stale = {"now": False}
+        ops.behind_target = lambda ws, b, t: stale["now"]
+
+        def address(ws, logf):
+            stale["now"] = True     # a sibling merged while the review ran
+        runner.behavior["address"] = address
+        gh.checks = ["SUCCESS", "SUCCESS"]
+        run(orch)
+        assert ("rebase", "main") in ops.events
+        assert ("force_push", BRANCH) in ops.events
+        assert gh.checks == [], "the checks are verified again on the rebased head"
+        assert "ready for a human to merge" in comments(tracker)
+        assert state.state_of(KEY) == "pr_open"
+        assert tracker.labels == []
+
+    def test_conflict_during_review_is_handed_to_a_human_not_called_ready(self, env):
+        orch, tracker, gh, ops, state, runner = env
+        stale = {"now": False}
+        ops.behind_target = lambda ws, b, t: stale["now"]
+        ops.rebase_ok = False
+        ops.rebase_clean_after_worker = False
+
+        def address(ws, logf):
+            stale["now"] = True
+        runner.behavior["address"] = address
+        run(orch)
+        assert ("abort", ops.workspace(KEY)) in ops.events
+        assert "ready for a human to merge" not in comments(tracker)
+        assert "conflicts with `main`" in comments(tracker)
+        assert tracker.labels == [KEY]
+        assert state.state_of(KEY) == "pr_open"

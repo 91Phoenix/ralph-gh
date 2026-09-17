@@ -137,6 +137,11 @@ class GitOps:
     def rebase_finished_clean(self, ws: str) -> bool:
         return gitrepo.rebase_finished_clean(ws)
 
+    def remote_sha(self, ws: str, target: str) -> str:
+        """The tip of origin/<target> as last fetched: the new base of a branch
+        that was just rebased onto it."""
+        return gitrepo._out(ws, "rev-parse", f"refs/remotes/origin/{target}")
+
     # -- invariants (thin wrappers so the orchestrator can be faked) ------------
     def pr_base_ok(self, ws: str, branch: str, target: str, base: str) -> bool:
         return gitrepo.pr_base_ok(ws, branch, target, base)

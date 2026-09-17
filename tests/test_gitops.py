@@ -94,3 +94,8 @@ class TestPublishAndInspect:
         assert ops.rebase_onto(prep.ws, "development")
         assert not ops.behind_target(prep.ws, BRANCH, "development")
         assert ops.rebase_finished_clean(prep.ws)
+        # After the rebase the branch's base is the target's tip, and the
+        # guard holds against THAT base, not the pre-rebase one.
+        new_base = ops.remote_sha(prep.ws, "development")
+        assert new_base and new_base != prep.base
+        assert ops.pr_base_ok(prep.ws, BRANCH, "development", new_base)
